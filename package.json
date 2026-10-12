@@ -1,0 +1,26 @@
+{
+  "name": "travel-guide-b",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "旅游攻略 B 端管理平台 · 基于 Cesium 的三维地图底座",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "type-check": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "cesium": "^1.126.0",
+    "pinia": "^2.3.0",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "~5.6.3",
+    "vite": "^5.4.11",
+    "vite-plugin-static-copy": "^2.2.0",
+    "vue-tsc": "^2.1.10"
+  }
+}

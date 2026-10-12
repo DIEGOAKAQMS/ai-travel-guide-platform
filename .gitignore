@@ -1,0 +1,14 @@
+node_modules
+dist
+dist-ssr
+dist-check
+*.local
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+*.log
+
+# 环境变量（含密钥，禁止提交）
+.env
+.env.*
+!.env.example

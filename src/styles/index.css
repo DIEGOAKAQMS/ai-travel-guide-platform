@@ -1,0 +1,136 @@
+/* ==========================================================================
+   旅游攻略 B 端 · 全局样式与主题变量
+   ========================================================================== */
+
+:root {
+  /* 背景层次 */
+  --bg-app: #eef2f8;
+  --bg-panel: #ffffff;
+  --bg-panel-2: #f6f8fc;
+  --bg-hover: #eaf0f9;
+  --bg-active: #dde8fb;
+
+  /* 描边 */
+  --border: #e2e8f2;
+  --border-strong: #ccd6e5;
+
+  /* 文字 */
+  --text-1: #17233a;
+  --text-2: #55637b;
+  --text-3: #8a97ac;
+
+  /* 主题色 */
+  --accent: #2f7dfa;
+  --accent-hover: #1f6ae6;
+  --accent-soft: rgba(47, 125, 250, 0.12);
+  --success: #12a06b;
+  --warn: #d98600;
+  --danger: #e04a4a;
+  /* 高亮路段色，与 guideRenderer 中的 HIGHLIGHT_COLOR 保持一致 */
+  --highlight: #1677ff;
+
+  /* 面板底色 / 阴影（浅色主题统一口径） */
+  --panel-bg: rgba(255, 255, 255, 0.94);
+  --panel-shadow: 0 6px 20px rgba(23, 43, 77, 0.12);
+  --chip-bg: rgba(23, 43, 77, 0.06);
+
+  /* 尺寸 */
+  --header-h: 52px;
+  --status-h: 30px;
+  --radius: 6px;
+  --radius-sm: 4px;
+
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-1);
+  background: var(--bg-app);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #c6d2e2;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #aebdd1;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ==========================================================================
+   通用组件类
+   ========================================================================== */
+
+/* 按钮 */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel-2);
+  color: var(--text-1);
+  font-size: 12px;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.btn:hover {
+  border-color: var(--accent);
+  background: var(--bg-hover);
+}
+.btn--primary {
+  border-color: transparent;
+  background: var(--accent);
+}
+.btn--primary:hover {
+  background: var(--accent-hover);
+}
+.btn--block {
+  width: 100%;
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
