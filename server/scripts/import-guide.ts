@@ -6,11 +6,11 @@
  * 离群复核都与在线生成的一致，导入后直接在地图工作台打开即可渲染。
  *
  * 用法（在 server 目录下执行）：
- *   npx tsx scripts/import-guide.ts ../docs/测试.txt                  # 正式导入
- *   npx tsx scripts/import-guide.ts ../docs/测试.txt --dry-run        # 只校验文件，不落点不写库
- *   npx tsx scripts/import-guide.ts ../docs/测试.txt --title "新标题"  # 覆盖标题
- *   npx tsx scripts/import-guide.ts ../docs/测试.txt --prompt "来源备注"  # 写进 guide.prompt
- *   npx tsx scripts/import-guide.ts ../docs/测试.txt --region 川西     # 覆盖区域（影响落点包围盒）
+ *   npx tsx scripts/import-guide.ts ../攻略.json                  # 正式导入
+ *   npx tsx scripts/import-guide.ts ../攻略.json --dry-run        # 只校验文件，不落点不写库
+ *   npx tsx scripts/import-guide.ts ../攻略.json --title "新标题"  # 覆盖标题
+ *   npx tsx scripts/import-guide.ts ../攻略.json --prompt "来源备注"  # 写进 guide.prompt
+ *   npx tsx scripts/import-guide.ts ../攻略.json --region 川西     # 覆盖区域（影响落点包围盒）
  *
  * ⚠️ 会真实消耗高德 / 天地图配额：可落点节点数 × 1~4 次请求，脚本按 4 并发限速执行。
  */

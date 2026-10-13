@@ -1,6 +1,6 @@
 # 旅游攻略管理平台 · 三维地图底座
 
-代码ai编程
+> **本项目代码由 AI 编程助手编写**：需求沟通与方案取舍由人完成，代码实现、调试与文档均由 AI 生成。
 
 基于 **Cesium + Vue3 + Vite + TypeScript + Node/Express + PostgreSQL(PostGIS)** 的 B 端旅游攻略系统。
 
