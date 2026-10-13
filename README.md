@@ -1,5 +1,7 @@
 # 旅游攻略管理平台 · 三维地图底座
 
+代码ai编程
+
 基于 **Cesium + Vue3 + Vite + TypeScript + Node/Express + PostgreSQL(PostGIS)** 的 B 端旅游攻略系统。
 
 **已完成的端到端能力**：一句话 → DeepSeek 生成行程骨架 → 高德地理编码逐个落点（含越界校验）→ 写入 PostGIS → 高德驾车路径规划 → 前端对话框与地图渲染。
