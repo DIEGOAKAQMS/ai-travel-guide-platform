@@ -2,6 +2,7 @@
   "name": "travel-guide-b",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "旅游攻略 B 端管理平台 · 基于 Cesium 的三维地图底座",
   "scripts": {

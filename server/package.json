@@ -2,6 +2,7 @@
   "name": "travel-guide-server",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "旅游攻略 B 端后端服务：DeepSeek 行程生成 + 高德地理编码/路径规划 + PostgreSQL/PostGIS",
   "main": "dist/index.js",
   "scripts": {
