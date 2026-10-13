@@ -10,7 +10,8 @@
  *   npx tsx scripts/repair-outliers.ts <guideId> --apply  # 写回数据库
  *   npx tsx scripts/repair-outliers.ts --all              # 扫描全部攻略（仅预览）
  */
-import 'dotenv/config'
+// 配置读取统一交给 src/config（分层加载 config.env > 根 .env > server/.env），
+// 这里不要再 import 'dotenv/config'，否则 server/.env 会先进 process.env、抢在 config.env 前面生效。
 import { bboxForRegion } from '../src/config'
 import { query, withTransaction } from '../src/db/pool'
 import { refineOutliers } from '../src/services/guide'

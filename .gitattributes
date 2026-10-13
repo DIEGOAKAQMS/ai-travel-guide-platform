@@ -1,0 +1,20 @@
+# 统一换行符为 LF，避免 Windows 上每次 git add 都刷「LF will be replaced by CRLF」
+# 并导致跨平台协作时整文件 diff。
+* text=auto eol=lf
+
+# 二进制文件不做文本转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.pptx binary
+*.xlsx binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.zip  binary
+
+# lockfile 在 diff 里折叠，减少噪音
+package-lock.json -diff linguist-generated

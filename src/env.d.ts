@@ -6,6 +6,11 @@ declare module '*.vue' {
   export default component
 }
 
+/**
+ * 注意：应用代码已不再直接读 `import.meta.env`，前端配置统一走根目录的
+ * config.env（由 vite.config.ts 注入为 `__APP_CONFIG__`，见 src/config/index.ts）。
+ * 下面这些 VITE_ 声明仅用于「config.env 里留空时」回退到根 .env 的旧用法。
+ */
 interface ImportMetaEnv {
   /** 天地图开发者 token */
   readonly VITE_TIANDITU_TOKEN: string

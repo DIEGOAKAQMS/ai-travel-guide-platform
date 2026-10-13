@@ -14,7 +14,8 @@
  *
  * ⚠️ 会真实消耗高德 / 天地图配额：可落点节点数 × 1~4 次请求，脚本按 4 并发限速执行。
  */
-import 'dotenv/config'
+// 配置读取统一交给 src/config（分层加载 config.env > 根 .env > server/.env），
+// 这里不要再 import 'dotenv/config'，否则 server/.env 会先进 process.env、抢在 config.env 前面生效。
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { bboxForRegion } from '../src/config'

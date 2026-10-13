@@ -1,16 +1,68 @@
-import 'dotenv/config'
+import { existsSync, readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { parse as parseEnv } from 'dotenv'
+
+/**
+ * 分层加载配置。
+ *
+ * 为什么不用 `import 'dotenv/config'`：它只读 server/.env，而项目里所有
+ * 「要花钱」的配置现在集中在仓库根目录的 config.env（见该文件顶部说明）。
+ * 这里有三个必须同时满足的约束：
+ *   1. config.env 要能覆盖两个历史 .env —— 用户只改这一个文件就该生效；
+ *   2. 历史 .env 仍要可用，老部署不该因为这次改动直接起不来；
+ *   3. 外部注入的真实环境变量（docker / CI）优先级最高。
+ * 因此按「低 → 高」依次合并，并规定**空值一律视为未设置**，让下层继续兜底。
+ */
+const SERVER_DIR = resolve(__dirname, '..')
+const ROOT_DIR = resolve(SERVER_DIR, '..')
+
+/** 统一配置文件（用户日常编辑的唯一文件，位于仓库根目录） */
+export const CONFIG_FILE = resolve(ROOT_DIR, 'config.env')
+
+const FILE_LAYERS = [
+  resolve(SERVER_DIR, '.env'), // 最低：历史后端配置
+  resolve(ROOT_DIR, '.env'), // 历史前端配置（也放了少量后端项）
+  CONFIG_FILE, // 最高：统一配置文件
+]
+
+function loadFileEnv(): Record<string, string> {
+  const merged: Record<string, string> = {}
+  for (const path of FILE_LAYERS) {
+    if (!existsSync(path)) continue
+    for (const [key, value] of Object.entries(parseEnv(readFileSync(path, 'utf8')))) {
+      if (value && value.trim()) merged[key] = value.trim()
+    }
+  }
+  return merged
+}
+
+const FILE_ENV = loadFileEnv()
+
+// 回写进 process.env：仓库里有脚本直接读 process.env（如 scripts/*.ts）。
+// 只补真正缺失的键，绝不覆盖外部注入的真实环境变量。
+for (const [key, value] of Object.entries(FILE_ENV)) {
+  if (!process.env[key] || !process.env[key]!.trim()) process.env[key] = value
+}
+
+/** 取配置值：外部环境变量 > 三个配置文件 > 未设置 */
+function envValue(name: string): string | undefined {
+  const fromProcess = process.env[name]
+  if (fromProcess && fromProcess.trim()) return fromProcess.trim()
+  return FILE_ENV[name]
+}
 
 function required(name: string): string {
-  const value = process.env[name]
-  if (!value || !value.trim()) {
-    throw new Error(`缺少必需的环境变量 ${name}，请检查 server/.env`)
+  const value = envValue(name)
+  if (!value) {
+    throw new Error(
+      `缺少必需的环境变量 ${name}，请在仓库根目录的 config.env 中配置（该文件有逐项说明）`,
+    )
   }
-  return value.trim()
+  return value
 }
 
 function optional(name: string, fallback: string): string {
-  const value = process.env[name]
-  return value && value.trim() ? value.trim() : fallback
+  return envValue(name) ?? fallback
 }
 
 export const config = {

@@ -405,7 +405,7 @@ onBeforeUnmount(() => {
     />
 
     <div v-if="!hasTiandituToken()" class="cesium-viewer__alert">
-      未检测到天地图 token，请在项目根目录 <code>.env</code> 中配置
+      未检测到天地图 token，请在项目根目录 <code>config.env</code> 中配置
       <code>VITE_TIANDITU_TOKEN</code> 后重启开发服务。
     </div>
   </div>
