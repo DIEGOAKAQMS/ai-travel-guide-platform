@@ -12,7 +12,7 @@ export interface BasemapPreset {
   label?: TiandituLayerOptions
 }
 
-/** 可切换的地图模式：卫星 / 高程 / 矢量 */
+/** 可切换的底图：卫星 / 矢量 */
 export const BASEMAPS: BasemapPreset[] = [
   {
     key: 'img',
@@ -20,13 +20,6 @@ export const BASEMAPS: BasemapPreset[] = [
     swatch: 'linear-gradient(135deg,#2b4a3f,#5d7f6c)',
     base: { type: 'img' },
     label: { type: 'cia' },
-  },
-  {
-    key: 'ter',
-    name: '高程',
-    swatch: 'linear-gradient(135deg,#8a6a3d,#c8a468)',
-    base: { type: 'ter', maximumLevel: 14 },
-    label: { type: 'cva' },
   },
   {
     key: 'vec',

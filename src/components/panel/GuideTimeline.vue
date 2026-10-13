@@ -10,9 +10,261 @@ import {
   formatStay,
 } from '@/config/guide'
 import { useGuideStore } from '@/stores/guide'
-import type { GuidePoiDto, GuideRouteDto, NodeKind } from '@/types/guide'
+import PoiSearchDialog from './PoiSearchDialog.vue'
+import type {
+  GuideDayDto,
+  GuidePoiDto,
+  GuideRouteDto,
+  GuideSaveDay,
+  GuideSavePayload,
+  GuideSavePoi,
+  NodeKind,
+} from '@/types/guide'
 
 const store = useGuideStore()
+
+// ---------------------------------------------------------------------------
+// 修改模式：在时间轴上直接增删 / 排序 / 换天，再让 AI 重新安排导航
+// ---------------------------------------------------------------------------
+
+/** 编辑草稿里的节点：保存载荷 + 渲染用的 key + 「坐标是否本次搜索确认」 */
+interface EditPoi extends GuideSavePoi {
+  key: string
+  /** 本次编辑中通过高德搜索确认过坐标 → 保存时标记为人工指定 */
+  picked: boolean
+}
+
+/** 编辑草稿里的一天：保存载荷 + 渲染用的 key */
+interface EditDay extends Omit<GuideSaveDay, 'pois'> {
+  key: string
+  pois: EditPoi[]
+}
+
+let editSeq = 0
+function editUid(prefix: string): string {
+  editSeq += 1
+  return `${prefix}_${Date.now().toString(36)}_${editSeq}`
+}
+
+/** 是否处于「修改」模式 */
+const editing = ref(false)
+/** 编辑草稿（仅编辑模式使用，不进 store） */
+const draftDays = ref<EditDay[]>([])
+/** 编辑模式下当前选中的节点 key（选中后才显示该行的操作条） */
+const selectedEditKey = ref<string | null>(null)
+/** 「+ 添加行程」的目标天 key（非空时弹出搜索弹窗） */
+const addTargetKey = ref<string | null>(null)
+/** 保存 + AI 重排进行中 */
+const savingEdit = ref(false)
+const editError = ref('')
+
+const addTargetDay = computed(
+  () => draftDays.value.find((day) => day.key === addTargetKey.value) ?? null,
+)
+
+/** 弹窗标题里的目标天文案 */
+const addTargetLabel = computed(() => {
+  const day = addTargetDay.value
+  if (!day) return ''
+  return `D${day.day_index}${day.title ? ` · ${day.title}` : ''}`
+})
+
+/** 编辑草稿里的节点总数 */
+const draftNodeCount = computed(() =>
+  draftDays.value.reduce((sum, day) => sum + day.pois.length, 0),
+)
+
+/** 把当前攻略拷成一份可变草稿（保存载荷需要的字段全都带上，避免 PUT 写空） */
+function buildDraft(): EditDay[] {
+  return (store.guide?.days ?? []).map((day) => ({
+    key: editUid('day'),
+    id: day.id,
+    day_index: day.day_index,
+    title: day.title,
+    summary: day.summary,
+    route_text: day.route_text,
+    stay_text: day.stay_text,
+    highlights: day.highlights,
+    cautions: day.cautions,
+    drive_km: day.drive_km,
+    drive_hours: day.drive_hours,
+    sleep_altitude_m: day.sleep_altitude_m,
+    max_altitude_m: day.max_altitude_m,
+    notes: [...day.notes],
+    pois: day.pois.map((poi) => ({
+      key: editUid('poi'),
+      id: poi.id,
+      name: poi.name,
+      kind: poi.kind,
+      priority: poi.priority,
+      arrive_time: poi.arrive_time,
+      stay_minutes: poi.stay_minutes,
+      leg_km: poi.leg_km,
+      city: poi.city,
+      address: poi.address,
+      lng: poi.lng,
+      lat: poi.lat,
+      notes: poi.notes,
+      warnings: poi.warnings,
+      tips: poi.tips,
+      picked: false,
+    })),
+  }))
+}
+
+function startEdit(): void {
+  if (!store.guide) return
+  draftDays.value = buildDraft()
+  selectedEditKey.value = null
+  editError.value = ''
+  editing.value = true
+  // 编辑时全部展开，免得来回点
+  expandedDays.value = draftDays.value.map((day) => day.day_index)
+}
+
+function cancelEdit(): void {
+  if (savingEdit.value) return
+  editing.value = false
+  draftDays.value = []
+  selectedEditKey.value = null
+  addTargetKey.value = null
+  editError.value = ''
+}
+
+function selectEdit(poiKey: string): void {
+  selectedEditKey.value = selectedEditKey.value === poiKey ? null : poiKey
+}
+
+/** 上移 / 下移（同一天内） */
+function movePoiEdit(day: EditDay, index: number, delta: -1 | 1): void {
+  const target = index + delta
+  if (target < 0 || target >= day.pois.length) return
+  const [poi] = day.pois.splice(index, 1)
+  day.pois.splice(target, 0, poi)
+}
+
+/** 删除节点 */
+function removePoiEdit(day: EditDay, index: number): void {
+  const [poi] = day.pois.splice(index, 1)
+  if (poi && selectedEditKey.value === poi.key) selectedEditKey.value = null
+}
+
+/** 移动到行程中的另一天（追加到该天末尾） */
+function movePoiToDay(day: EditDay, index: number, event: Event): void {
+  const select = event.target as HTMLSelectElement
+  const targetKey = select.value
+  // 选项是「动作」而非「状态」，选完立刻恢复占位
+  select.value = ''
+  if (!targetKey) return
+
+  const target = draftDays.value.find((item) => item.key === targetKey)
+  if (!target || target.key === day.key) return
+
+  const [poi] = day.pois.splice(index, 1)
+  if (!poi) return
+  target.pois.push(poi)
+  selectedEditKey.value = poi.key
+  if (!isExpanded(target.day_index)) expandedDays.value.push(target.day_index)
+}
+
+function openAdd(day: EditDay): void {
+  addTargetKey.value = day.key
+  if (!isExpanded(day.day_index)) expandedDays.value.push(day.day_index)
+}
+
+function onAddConfirm(value: {
+  name: string
+  kind: NodeKind
+  city: string | null
+  address: string | null
+  lng: number
+  lat: number
+}): void {
+  const day = addTargetDay.value
+  if (!day) return
+
+  const poi: EditPoi = {
+    key: editUid('poi'),
+    id: null,
+    name: value.name,
+    kind: value.kind,
+    priority: 'normal',
+    arrive_time: null,
+    stay_minutes: null,
+    leg_km: null,
+    city: value.city,
+    address: value.address,
+    lng: value.lng,
+    lat: value.lat,
+    notes: null,
+    warnings: null,
+    tips: null,
+    picked: true,
+  }
+  day.pois.push(poi)
+  selectedEditKey.value = poi.key
+  addTargetKey.value = null
+}
+
+/** 保存草稿 → AI 重新编排顺序与时间 → 按新顺序重算驾车路线 */
+async function saveEdit(): Promise<void> {
+  if (!store.guide || savingEdit.value) return
+  if (draftNodeCount.value === 0) {
+    editError.value = '时间轴上至少要保留一个节点'
+    return
+  }
+
+  const payload: GuideSavePayload = {
+    title: store.guide.title,
+    region: store.guide.region,
+    summary: store.guide.summary,
+    days: draftDays.value.map((day) => ({
+      id: day.id,
+      day_index: day.day_index,
+      title: day.title,
+      summary: day.summary,
+      route_text: day.route_text,
+      stay_text: day.stay_text,
+      highlights: day.highlights,
+      cautions: day.cautions,
+      drive_km: day.drive_km,
+      drive_hours: day.drive_hours,
+      sleep_altitude_m: day.sleep_altitude_m,
+      max_altitude_m: day.max_altitude_m,
+      notes: day.notes,
+      pois: day.pois.map((poi) => ({
+        id: poi.id,
+        name: poi.name,
+        kind: poi.kind,
+        priority: poi.priority,
+        arrive_time: poi.arrive_time,
+        stay_minutes: poi.stay_minutes,
+        leg_km: poi.leg_km,
+        city: poi.city,
+        address: poi.address,
+        lng: poi.lng,
+        lat: poi.lat,
+        notes: poi.notes,
+        warnings: poi.warnings,
+        tips: poi.tips,
+        manual: poi.picked,
+      })),
+    })),
+  }
+
+  savingEdit.value = true
+  editError.value = ''
+  const ok = await store.saveTimelineAndReplan(payload)
+  savingEdit.value = false
+
+  if (ok) {
+    editing.value = false
+    draftDays.value = []
+    selectedEditKey.value = null
+  } else {
+    editError.value = store.error ?? '保存失败，请重试'
+  }
+}
 
 /** 整个面板是否收起 */
 const collapsed = ref(false)
@@ -33,6 +285,67 @@ const allExpanded = computed(
   () => days.value.length > 0 && expandedDays.value.length === days.value.length,
 )
 
+/**
+ * 当天出发时间（首站的 arrive_time）换算成分钟。
+ *
+ * 时间轴每天的第一个节点就是当天的出发地，所以它的 arrive_time 就是出发时间。
+ */
+function departureMinutes(day: GuideDayDto): number | null {
+  const matched = /^(\d{1,2}):(\d{2})/.exec(day.pois[0]?.arrive_time ?? '')
+  if (!matched) return null
+  return Number(matched[1]) * 60 + Number(matched[2])
+}
+
+/**
+ * 全行程的「常规出发时间」：各天出发时间里出现次数最多的那个（并列取最晚）。
+ *
+ * 有它才能判断某天是不是"比别的天早"：用户要的出发时间是固定的，众数就是那个时间；
+ * 模型偶尔会因为赶路 / 看日出把某一天提前，那天的出发时间就会明显早于众数。
+ */
+const normalDepartureMinutes = computed(() => {
+  const counts = new Map<number, number>()
+  for (const day of days.value) {
+    const minutes = departureMinutes(day)
+    if (minutes !== null) counts.set(minutes, (counts.get(minutes) ?? 0) + 1)
+  }
+
+  let result: number | null = null
+  let bestCount = 0
+  for (const [minutes, count] of counts) {
+    const laterTie = count === bestCount && result !== null && minutes > result
+    if (count > bestCount || laterTie) {
+      result = minutes
+      bestCount = count
+    }
+  }
+  return result
+})
+
+/** 早于常规时间多少分钟才算「提前出发」；差值太小就不值得单独占一行 */
+const EARLY_START_MINUTES = 30
+
+/** 这天是否比行程的常规出发时间更早（模板里据此决定是否展示提前出发说明） */
+function isEarlyStart(day: GuideDayDto): boolean {
+  const minutes = departureMinutes(day)
+  const normal = normalDepartureMinutes.value
+  return minutes !== null && normal !== null && normal - minutes >= EARLY_START_MINUTES
+}
+
+/** 「今日 07:00 出发」里的时间文案：直接用首站的 arrive_time（已是 HH:mm） */
+function departureText(day: GuideDayDto): string {
+  return day.pois[0]?.arrive_time ?? ''
+}
+
+/**
+ * 提前出发的原因：提示词要求模型把原因写进当天首站的玩法描述（notes）。
+ *
+ * 没写就只显示出发时间 —— 那本身也是有效信息（这天确实比别的天早），
+ * 顺便把"模型没给理由"这件事暴露出来，而不是悄悄藏掉。
+ */
+function departureReason(day: GuideDayDto): string {
+  return (day.pois[0]?.notes ?? '').trim()
+}
+
 /** 地图上每一天是否都被隐藏了 */
 const allDaysHidden = computed(
   () =>
@@ -50,6 +363,10 @@ watch(
   () => store.guide?.id,
   () => {
     expandedDays.value = days.value.length > 0 ? [days.value[0].day_index] : []
+    // 草稿是上一份攻略拷出来的（里面的 id 都属于它），换了一份攻略就必须丢掉：
+    // 否则接着点「保存并重新规划」，PUT 会带着旧攻略的天 / 节点 id 打到新攻略上，
+    // 新攻略原有的行程会被整批删掉。
+    if (editing.value) cancelEdit()
   },
   { immediate: true },
 )
@@ -170,41 +487,178 @@ function selectRoute(route: GuideRouteDto): void {
   <section v-if="store.guide" class="tl">
     <header class="tl__head">
       <span class="tl__title">行程时间轴</span>
-      <span class="tl__count">{{ store.guide.total_days }} 天 · {{ nodeCount }} 节点</span>
+      <span class="tl__count">
+        <template v-if="editing">编辑中 · {{ draftNodeCount }} 节点</template>
+        <template v-else>{{ store.guide.total_days }} 天 · {{ nodeCount }} 节点</template>
+      </span>
       <div class="tl__head-actions">
-        <button
-          v-if="!collapsed"
-          type="button"
-          class="tl__link"
-          @click="allExpanded ? collapseAll() : expandAll()"
-        >
-          {{ allExpanded ? '全部收起' : '全部展开' }}
-        </button>
-        <button
-          v-if="!collapsed"
-          type="button"
-          class="tl__link"
-          :title="allDaysHidden ? '在地图上显示所有天' : '在地图上隐藏所有天'"
-          @click="toggleAllDays"
-        >
-          {{ allDaysHidden ? '全部显示' : '全部隐藏' }}
-        </button>
-        <button
-          type="button"
-          class="tl__link"
-          :title="collapsed ? '展开时间轴' : '收起时间轴'"
-          @click="collapsed = !collapsed"
-        >
-          {{ collapsed ? '▸' : '▾' }}
-        </button>
+        <template v-if="editing">
+          <button type="button" class="tl__link" :disabled="savingEdit" @click="cancelEdit">
+            取消
+          </button>
+          <button
+            type="button"
+            class="tl__link tl__link--primary"
+            :disabled="savingEdit"
+            @click="saveEdit"
+          >
+            {{ savingEdit ? '重新规划中…' : '保存并重新规划' }}
+          </button>
+        </template>
+        <template v-else>
+          <button
+            v-if="!collapsed"
+            type="button"
+            class="tl__link"
+            @click="allExpanded ? collapseAll() : expandAll()"
+          >
+            {{ allExpanded ? '全部收起' : '全部展开' }}
+          </button>
+          <button
+            v-if="!collapsed"
+            type="button"
+            class="tl__link"
+            :title="allDaysHidden ? '在地图上显示所有天' : '在地图上隐藏所有天'"
+            @click="toggleAllDays"
+          >
+            {{ allDaysHidden ? '全部显示' : '全部隐藏' }}
+          </button>
+          <button
+            v-if="!collapsed"
+            type="button"
+            class="tl__link tl__link--edit"
+            title="修改这条时间轴"
+            @click="startEdit"
+          >
+            修改
+          </button>
+          <button
+            type="button"
+            class="tl__link"
+            :title="collapsed ? '展开时间轴' : '收起时间轴'"
+            @click="collapsed = !collapsed"
+          >
+            {{ collapsed ? '▸' : '▾' }}
+          </button>
+        </template>
       </div>
     </header>
 
-    <p v-if="!collapsed && store.issues.length > 0" class="tl__issues">
+    <p v-if="editing" class="tl__tips">
+      点节点选中后，可删除 / 上移 / 下移 / 移动到其它天；每天底部的「+ 添加行程」可新增一站。
+    </p>
+    <!-- 保存 + AI 重排 + 重算路线是一整轮长任务，耗时就取 store 里那份统一计时 -->
+    <p v-if="editing && savingEdit" class="tl__tips tl__tips--busy">
+      {{ store.stage }}（{{ store.elapsedSec }}s）
+    </p>
+    <p v-if="editing && editError" class="tl__issues">{{ editError }}</p>
+
+    <p v-if="!editing && !collapsed && store.issues.length > 0" class="tl__issues">
       {{ store.issues.length }} 个节点落点可疑，需人工校正
     </p>
 
     <div v-if="!collapsed" class="tl__body">
+      <!-- ==================== 修改模式：直接编辑草稿 ==================== -->
+      <template v-if="editing">
+        <article v-for="day in draftDays" :key="day.key" class="tl__day">
+          <div class="tl__day-head" @click="toggleExpand(day.day_index)">
+            <span class="tl__caret">{{ isExpanded(day.day_index) ? '▾' : '▸' }}</span>
+            <span class="tl__dot" :style="{ background: dayColor(day.day_index) }" />
+            <span class="tl__day-title" :title="day.title ?? ''">
+              D{{ day.day_index }}<template v-if="day.title"> · {{ day.title }}</template>
+            </span>
+            <span class="tl__day-meta">{{ day.pois.length }} 节点</span>
+          </div>
+
+          <ul v-if="isExpanded(day.day_index)" class="tl__nodes">
+            <li v-for="(poi, index) in day.pois" :key="poi.key" class="tl__row">
+              <button
+                type="button"
+                class="tl__node"
+                :class="{ 'is-selected': selectedEditKey === poi.key }"
+                @click="selectEdit(poi.key)"
+              >
+                <span class="tl__time">{{ poi.arrive_time ?? '--:--' }}</span>
+
+                <span class="tl__rail">
+                  <span class="tl__node-dot" :style="{ background: KIND_COLOR[poi.kind] }" />
+                </span>
+
+                <span class="tl__content">
+                  <span class="tl__name-row">
+                    <span class="tl__kind" :title="KIND_TEXT[poi.kind]">
+                      {{ KIND_ICON[poi.kind] }}
+                    </span>
+                    <span class="tl__name">{{ poi.name }}</span>
+                    <span v-if="!poi.id" class="tl__badge tl__badge--new">新增</span>
+                    <span v-else-if="poi.priority === 'key'" class="tl__badge tl__badge--key">
+                      {{ PRIORITY_TEXT.key }}
+                    </span>
+                  </span>
+                  <!-- 地址只在「本次新增」时展示：那是刚确认的结果；
+                       已有节点的地址属于只读信息，修改模式下不显示 -->
+                  <span v-if="poi.address && !poi.id" class="tl__addr">{{ poi.address }}</span>
+                </span>
+              </button>
+
+              <!-- 选中这一行后才出现操作条，避免整屏都是按钮 -->
+              <div v-if="selectedEditKey === poi.key" class="tl__ops">
+                <button
+                  type="button"
+                  class="btn btn--mini"
+                  :disabled="index === 0"
+                  @click="movePoiEdit(day, index, -1)"
+                >
+                  上移
+                </button>
+                <button
+                  type="button"
+                  class="btn btn--mini"
+                  :disabled="index === day.pois.length - 1"
+                  @click="movePoiEdit(day, index, 1)"
+                >
+                  下移
+                </button>
+                <label class="tl__ops-move">
+                  <span class="tl__ops-label">移动到</span>
+                  <select class="tl__ops-select" value="" @change="movePoiToDay(day, index, $event)">
+                    <option value="" disabled>选择天</option>
+                    <option
+                      v-for="target in draftDays"
+                      :key="target.key"
+                      :value="target.key"
+                      :disabled="target.key === day.key"
+                    >
+                      D{{ target.day_index }}
+                    </option>
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  class="btn btn--mini btn--danger"
+                  @click="removePoiEdit(day, index)"
+                >
+                  删除
+                </button>
+              </div>
+            </li>
+
+            <li>
+              <button
+                type="button"
+                class="tl__add"
+                :title="`在 D${day.day_index} 末尾添加一站`"
+                @click="openAdd(day)"
+              >
+                + 添加行程
+              </button>
+            </li>
+          </ul>
+        </article>
+      </template>
+
+      <template v-else>
+      <!-- ==================== 浏览模式：只读时间轴 ==================== -->
       <article
         v-for="day in days"
         :key="day.id"
@@ -236,6 +690,12 @@ function selectRoute(route: GuideRouteDto): void {
         <template v-else>
           <!-- 时间轴上方只留「在路上」的里程与时间，以及需要注意的提示；
                住宿 / 游玩 / 海拔 / 看点 / 路线串联 / 备注这些介绍性内容不再铺在这里 -->
+          <!-- 例外：比行程常规时间更早出发的那天，把「几点走 + 为什么」提到最显眼的位置，
+               否则用户只会看到一行比别的天更早的时刻，不知道为什么 -->
+          <p v-if="isEarlyStart(day)" class="tl__fact tl__fact--start">
+            <b>今日 {{ departureText(day) }} 出发</b><template v-if="departureReason(day)"> · {{ departureReason(day) }}</template>
+          </p>
+
           <ul v-if="day.drive_km" class="tl__facts">
             <li class="is-move">
               <b>行驶</b>{{ day.drive_km }} km<template v-if="day.drive_hours"> · {{ day.drive_hours }}</template>
@@ -340,7 +800,16 @@ function selectRoute(route: GuideRouteDto): void {
           </ul>
         </template>
       </article>
+      </template>
     </div>
+
+    <!-- 添加行程：类型选择 → 高德搜索 → 确认地址 -->
+    <PoiSearchDialog
+      v-if="addTargetDay"
+      :day-label="addTargetLabel"
+      @close="addTargetKey = null"
+      @confirm="onAddConfirm"
+    />
   </section>
 </template>
 
@@ -363,19 +832,25 @@ function selectRoute(route: GuideRouteDto): void {
 .tl__head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  /* 宽度不够时整块操作区折到第二行（表头变高），
+     而不是把「全部收起」这类按钮文字挤成两行 */
+  flex-wrap: wrap;
+  gap: 6px 10px;
   flex: 0 0 auto;
-  padding: 9px 12px;
+  padding: 10px 12px;
   border-bottom: 1px solid var(--border);
 }
 
 .tl__title {
+  flex: 0 0 auto;
   color: var(--text-1);
   font-size: 12px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .tl__count {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   color: var(--text-3);
@@ -385,15 +860,19 @@ function selectRoute(route: GuideRouteDto): void {
 }
 
 .tl__head-actions {
+  flex: 0 0 auto;
   margin-left: auto;
   display: flex;
   align-items: center;
   gap: 10px;
+  white-space: nowrap;
 }
 
 .tl__link {
+  flex: 0 0 auto;
   color: var(--text-3);
   font-size: 11px;
+  white-space: nowrap;
 }
 
 .tl__link:hover {
@@ -528,6 +1007,16 @@ function selectRoute(route: GuideRouteDto): void {
 
 .tl__fact--warn b {
   color: var(--warn);
+}
+
+/* 提前出发说明：只有比行程常规时间更早的天才会出现这一行 */
+.tl__fact--start {
+  margin-top: 6px;
+}
+
+.tl__fact--start b {
+  color: var(--accent);
+  font-weight: 600;
 }
 
 /* ---------- 节点 ---------- */
@@ -814,5 +1303,139 @@ function selectRoute(route: GuideRouteDto): void {
 
 .tl__tip {
   color: var(--success);
+}
+
+/* ==========================================================================
+   修改模式
+   ========================================================================== */
+
+.tl__link--edit {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.tl__link--primary {
+  padding: 3px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: #ffffff;
+  font-weight: 500;
+}
+
+.tl__link--primary:hover {
+  background: var(--accent-hover);
+  color: #ffffff;
+}
+
+.tl__link:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.tl__tips {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(47, 125, 250, 0.07);
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.tl__tips--busy {
+  color: var(--accent);
+}
+
+/* 一行 = 节点 + （选中时的）操作条 */
+.tl__row {
+  display: flex;
+  flex-direction: column;
+}
+
+.tl__ops {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 2px 0 6px 48px;
+  padding: 5px 8px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-panel-2);
+}
+
+.tl__ops-move {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tl__ops-label {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.tl__ops-select {
+  height: 22px;
+  padding: 0 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  color: var(--text-1);
+  font-size: 11px;
+  outline: none;
+}
+
+.tl__ops-select:focus {
+  border-color: var(--accent);
+}
+
+/* 每天底部的「+ 添加行程」矩形框 */
+.tl__add {
+  display: block;
+  width: 100%;
+  margin: 6px 0 4px;
+  padding: 6px 8px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11px;
+  transition: all 0.15s;
+}
+
+.tl__add:hover {
+  border-color: var(--accent);
+  background: rgba(47, 125, 250, 0.06);
+  color: var(--accent);
+}
+
+.tl__badge--new {
+  background: rgba(18, 160, 107, 0.14);
+  color: var(--success);
+}
+
+.tl__addr {
+  overflow: hidden;
+  color: var(--text-3);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.btn--mini {
+  padding: 3px 9px;
+  font-size: 11px;
+}
+
+.btn--danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.btn--danger:hover {
+  border-color: var(--danger);
+  background: rgba(224, 74, 74, 0.08);
 }
 </style>

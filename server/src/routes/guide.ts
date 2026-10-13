@@ -2,7 +2,8 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import type { PoolClient } from 'pg'
 import { query, queryOne, withTransaction } from '../db/pool'
 import { planDriving, searchPoi, type PlaceCandidate } from '../services/amap'
-import { generateGuide, reviseGuide, searchKeywords, shortCity } from '../services/guide'
+import { clarifyGuideStream } from '../services/llm'
+import { generateGuide, replanGuide, reviseGuide, searchKeywords, shortCity } from '../services/guide'
 import { wgs84ToGcj02 } from '../utils/coord'
 import { computeArrivalTimes, type ScheduleLeg, type ScheduleNode } from '../utils/schedule'
 import type { GuideDayDto, GuideDto, GuidePoiDto, GuideRouteDto, PoiPhoto } from '../types'
@@ -15,6 +16,31 @@ function asyncHandler(
 ) {
   return (req: Request, res: Response, next: NextFunction) => {
     fn(req, res, next).catch(next)
+  }
+}
+
+/** 打开一条 SSE 通道，返回事件发送器（内部自行处理「客户端已断开」） */
+function openSseChannel(res: Response): { send: (event: string, data: unknown) => void } {
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
+  // 关闭 Nginx 等反代的缓冲，否则事件会被攒着一次性吐出
+  res.setHeader('X-Accel-Buffering', 'no')
+  res.flushHeaders()
+
+  // 注意：必须监听 res 而不是 req。
+  // Node 16+ 起 req 的 'close' 会在「请求体读取完毕」时触发（而非客户端断开），
+  // 若用它做标志位，首个事件之后的所有 write 都会被静默丢弃。
+  let closed = false
+  res.on('close', () => {
+    closed = true
+  })
+
+  return {
+    send: (event, data) => {
+      if (closed || res.writableEnded) return
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+    },
   }
 }
 
@@ -43,6 +69,104 @@ function toPhotoList(value: unknown): PoiPhoto[] {
     photos.push({ title: typeof record.title === 'string' ? record.title : '', url })
   }
   return photos
+}
+
+// ---------------------------------------------------------------------------
+// 入参校验
+//
+// 非法入参（非 uuid 的 id、非字符串的 prompt、超长的关键词…）必须在这里被拦下来，
+// 否则它会一路走到 pg / 高德，最后变成一个 500 —— 前端只看到「服务器内部错误」，
+// 既定位不到原因，也分不清是「你传错了」还是「服务挂了」。
+// ---------------------------------------------------------------------------
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** 需求描述 / 修改要求的长度上限 */
+const MAX_PROMPT_LEN = 2000
+/** 地点关键词的长度上限（高德也放不下更长的词） */
+const MAX_KEYWORD_LEN = 60
+
+/**
+ * 路径参数校验中间件：不是合法 uuid 直接 400。
+ *
+ * 直接把 id 丢给 pg 会抛 22P02（invalid input syntax for type uuid），
+ * 经错误中间件变成 500，看起来像服务出了问题。
+ */
+function requireUuidParam(...names: string[]) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    for (const name of names) {
+      if (!UUID_RE.test(req.params[name] ?? '')) {
+        res.status(400).json({ ok: false, error: `${name} 不是合法的 UUID` })
+        return
+      }
+    }
+    next()
+  }
+}
+
+/**
+ * 读取必填文本参数；不合法时已写好响应并返回 null。
+ *
+ * 只接受真正的字符串：`?keyword=a&keyword=b` 会被解析成数组（过去 String() 硬转
+ * 会得到 "a,b" 这种脏值），而 prompt 传数字会在 .trim() 上直接抛 TypeError。
+ */
+function requireText(
+  res: Response,
+  value: unknown,
+  name: string,
+  maxLen = MAX_PROMPT_LEN,
+): string | null {
+  if (typeof value !== 'string') {
+    res.status(400).json({ ok: false, error: `${name} 必须是字符串` })
+    return null
+  }
+  const text = value.trim()
+  if (!text) {
+    res.status(400).json({ ok: false, error: `${name} 不能为空` })
+    return null
+  }
+  if (text.length > maxLen) {
+    res.status(400).json({ ok: false, error: `${name} 过长（最多 ${maxLen} 字）` })
+    return null
+  }
+  return text
+}
+
+/** 读取可选文本参数：缺省返回 undefined；传了但不是合法文本则返回 null（已响应 400） */
+function optionalText(
+  res: Response,
+  value: unknown,
+  name: string,
+  maxLen = MAX_PROMPT_LEN,
+): string | undefined | null {
+  if (value === undefined || value === null) return undefined
+  return requireText(res, value, name, maxLen)
+}
+
+/** 生成类接口（生成 / 生成流）的公共入参校验；不合法时已响应 400 并返回 null */
+function readGenerateParams(
+  req: Request,
+  res: Response,
+): { prompt: string; days?: number; region?: string } | null {
+  const body = (req.body ?? {}) as { prompt?: unknown; days?: unknown; region?: unknown }
+
+  const prompt = requireText(res, body.prompt, 'prompt')
+  if (!prompt) return null
+
+  let days: number | undefined
+  if (body.days !== undefined && body.days !== null && body.days !== '') {
+    const parsed = Number(body.days)
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 60) {
+      res.status(400).json({ ok: false, error: 'days 必须是 1~60 之间的天数' })
+      return null
+    }
+    days = Math.round(parsed)
+  }
+
+  const region = optionalText(res, body.region, 'region', MAX_KEYWORD_LEN)
+  if (region === null) return null
+
+  return { prompt, days, region: region || undefined }
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +207,31 @@ interface SaveDayPayload {
   max_altitude_m?: number | null
   notes?: string[]
   pois?: SavePoiPayload[]
+}
+
+/**
+ * 校验整份保存的 days 载荷结构；返回错误文案，null 表示通过。
+ *
+ * 关键的一条：**days 为空数组要拒绝**。PUT 的语义是「整份覆盖」，
+ * 传空数组会把这份攻略的天、节点、路线全部删光（total_days 归零），
+ * 而前端只要有一次渲染出空列表（草稿没加载出来 / 切换攻略时残留旧草稿），
+ * 一保存就是一次不可逆的清空。
+ */
+function validateDaysPayload(days: unknown): string | null {
+  if (!Array.isArray(days)) return 'days 必须是数组'
+  if (days.length === 0) return 'days 不能为空：整份保存至少要保留一天'
+
+  for (const day of days) {
+    if (!day || typeof day !== 'object' || Array.isArray(day)) {
+      return 'days 的每一项都必须是对象'
+    }
+    const record = day as SaveDayPayload
+    if (!Number.isFinite(Number(record.day_index))) return 'days[].day_index 必须是数字'
+    if (record.pois !== undefined && !Array.isArray(record.pois)) {
+      return 'days[].pois 必须是数组'
+    }
+  }
+  return null
 }
 
 /** 按 id 更新、不存在则插入一天，返回其 id */
@@ -205,23 +354,11 @@ async function upsertPoi(
 guideRouter.post(
   '/generate',
   asyncHandler(async (req, res) => {
-    const { prompt, days, region } = req.body as {
-      prompt?: string
-      days?: number
-      region?: string
-    }
-
-    if (!prompt || !prompt.trim()) {
-      res.status(400).json({ ok: false, error: 'prompt 不能为空' })
-      return
-    }
+    const params = readGenerateParams(req, res)
+    if (!params) return
 
     const started = Date.now()
-    const result = await generateGuide({
-      prompt: prompt.trim(),
-      days: days ? Number(days) : undefined,
-      region: region?.trim() || undefined,
-    })
+    const result = await generateGuide(params)
 
     const guide = await loadGuide(result.guideId)
 
@@ -247,16 +384,8 @@ guideRouter.post(
 guideRouter.post(
   '/generate/stream',
   asyncHandler(async (req, res) => {
-    const { prompt, days, region } = req.body as {
-      prompt?: string
-      days?: number
-      region?: string
-    }
-
-    if (!prompt || !prompt.trim()) {
-      res.status(400).json({ ok: false, error: 'prompt 不能为空' })
-      return
-    }
+    const params = readGenerateParams(req, res)
+    if (!params) return
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
     res.setHeader('Cache-Control', 'no-cache, no-transform')
@@ -282,7 +411,7 @@ guideRouter.post(
 
     try {
       const result = await generateGuide(
-        { prompt: prompt.trim(), days: days ? Number(days) : undefined, region: region?.trim() || undefined },
+        params,
         (event) => {
           if (event.type === 'reasoning') {
             send('reasoning', { text: event.text })
@@ -305,6 +434,45 @@ guideRouter.post(
       send('error', { message: (error as Error).message || '生成失败' })
     } finally {
       if (!closed) res.end()
+    }
+  }),
+)
+
+// ---------------------------------------------------------------------------
+// POST /api/guide/clarify/stream —— 生成攻略前的澄清提问（SSE 流式）
+//
+// 用户给出初步想法后，先让模型反问几个关键问题；用户答完再带着答案去生成，
+// 避免一上来就凭猜测排一整条行程。
+//
+// 事件类型：
+//   stage     { stage, message }
+//   reasoning { text }
+//   clarify   { questions }   澄清问题列表
+//   error     { message }
+// ---------------------------------------------------------------------------
+guideRouter.post(
+  '/clarify/stream',
+  asyncHandler(async (req, res) => {
+    // 校验必须放在开 SSE 通道之前：通道一开响应头就发出去了，
+    // 再想回一个 400 的 JSON 就晚了。
+    const prompt = requireText(res, (req.body as { prompt?: unknown })?.prompt, 'prompt')
+    if (!prompt) return
+
+    const { send } = openSseChannel(res)
+
+    try {
+      send('stage', { stage: 'clarifying', message: '正在梳理还需要确认的信息…' })
+
+      const { plan } = await clarifyGuideStream(prompt, (delta) => {
+        if (delta.reasoning) send('reasoning', { text: delta.reasoning })
+      })
+
+      send('clarify', { questions: plan.questions })
+    } catch (error) {
+      console.error('[clarify/stream] 失败：', error)
+      send('error', { message: (error as Error).message || '提问失败' })
+    } finally {
+      if (!res.writableEnded) res.end()
     }
   }),
 )
@@ -346,10 +514,46 @@ guideRouter.get(
 )
 
 // ---------------------------------------------------------------------------
+// GET /api/guide/place/search —— 高德 POI 搜索（时间轴手动添加行程用）
+//
+// 返回 WGS84 坐标：前端确认某个候选后直接带坐标提交保存。
+// 注意：必须注册在 GET /:id 之前，`/place/search` 是两段路径虽不会撞上单段
+// 的 /:id，但放在前面可读性更好、也避免后续新增路由时踩坑。
+// ---------------------------------------------------------------------------
+guideRouter.get(
+  '/place/search',
+  asyncHandler(async (req, res) => {
+    const keyword = requireText(res, req.query.keyword, 'keyword', MAX_KEYWORD_LEN)
+    if (!keyword) return
+
+    const city = optionalText(res, req.query.city, 'city', MAX_KEYWORD_LEN)
+    if (city === null) return
+
+    const candidates = await searchPoi(keyword, {
+      city: city || undefined,
+      limit: 10,
+    })
+
+    res.json({
+      ok: true,
+      data: candidates.map((item) => ({
+        name: item.name,
+        address: item.address ?? '',
+        city: [item.province, item.city, item.district].filter(Boolean).join(''),
+        lng: item.lng,
+        lat: item.lat,
+        poiType: item.poiType ?? '',
+      })),
+    })
+  }),
+)
+
+// ---------------------------------------------------------------------------
 // GET /api/guide/:id —— 攻略详情
 // ---------------------------------------------------------------------------
 guideRouter.get(
   '/:id',
+  requireUuidParam('id'),
   asyncHandler(async (req, res) => {
     const guide = await loadGuide(req.params.id)
     if (!guide) {
@@ -365,8 +569,9 @@ guideRouter.get(
 // ---------------------------------------------------------------------------
 guideRouter.patch(
   '/:id',
+  requireUuidParam('id'),
   asyncHandler(async (req, res) => {
-    const body = req.body as {
+    const body = (req.body ?? {}) as {
       title?: string
       region?: string | null
       summary?: string | null
@@ -423,20 +628,25 @@ guideRouter.patch(
 //
 // 按 id upsert 天与节点：已有 id 的原地更新（保留其下路线段），
 // 载荷中缺失的天 / 节点会被删除（级联删除对应路线段）。
+//
+// 注意这是「整份覆盖」语义：**空 days 一律拒绝**，
+// 否则一次误提交（草稿未加载 / 残留了别的攻略的草稿）就会把整份攻略清空。
 // ---------------------------------------------------------------------------
 guideRouter.put(
   '/:id',
+  requireUuidParam('id'),
   asyncHandler(async (req, res) => {
     const guideId = req.params.id
-    const body = req.body as {
+    const body = (req.body ?? {}) as {
       title?: string
       region?: string | null
       summary?: string | null
       days?: SaveDayPayload[]
     }
 
-    if (!Array.isArray(body.days)) {
-      res.status(400).json({ ok: false, error: 'days 必须是数组' })
+    const daysError = validateDaysPayload(body.days)
+    if (daysError) {
+      res.status(400).json({ ok: false, error: daysError })
       return
     }
 
@@ -446,7 +656,7 @@ guideRouter.put(
       return
     }
 
-    const days = body.days
+    const days = body.days as SaveDayPayload[]
 
     await withTransaction(async (client) => {
       // 1) 主表基础信息
@@ -515,6 +725,7 @@ guideRouter.put(
 // ---------------------------------------------------------------------------
 guideRouter.delete(
   '/:id',
+  requireUuidParam('id'),
   asyncHandler(async (req, res) => {
     const deleted = await queryOne<{ id: string }>(
       'DELETE FROM guide WHERE id = $1 RETURNING id',
@@ -534,12 +745,19 @@ guideRouter.delete(
 // ---------------------------------------------------------------------------
 guideRouter.patch(
   '/poi/:poiId',
+  requireUuidParam('poiId'),
   asyncHandler(async (req, res) => {
-    const { lng, lat, day_id, seq } = req.body as {
+    const { lng, lat, day_id, seq } = (req.body ?? {}) as {
       lng?: number
       lat?: number
       day_id?: string
       seq?: number
+    }
+
+    // day_id 也是 uuid 列，非法值同样会在 pg 里炸成 500
+    if (day_id !== undefined && !UUID_RE.test(day_id)) {
+      res.status(400).json({ ok: false, error: 'day_id 不是合法的 UUID' })
+      return
     }
 
     const sets: string[] = []
@@ -691,6 +909,7 @@ function photoScore(item: PlaceCandidate, keyword: string): number {
 // ---------------------------------------------------------------------------
 guideRouter.get(
   '/poi/:poiId/photos',
+  requireUuidParam('poiId'),
   asyncHandler(async (req, res) => {
     const poi = await queryOne<{
       id: string
@@ -733,6 +952,7 @@ guideRouter.get(
 // ---------------------------------------------------------------------------
 guideRouter.post(
   '/:id/route',
+  requireUuidParam('id'),
   asyncHandler(async (req, res) => {
     const guideId = req.params.id
     const strategy = Number((req.body as { strategy?: number })?.strategy ?? 0)
@@ -859,6 +1079,29 @@ guideRouter.post(
         )
       }
 
+      // 用真实里程回填「距上一节点里程」（时间轴上那个里程胶囊）。
+      // 重排 / 增删节点后模型当初估的值已失效，这里统一以高德结果为准。
+      //
+      // 跨天转移段也要一起回填：每天第一个节点没有再往前的段内路段，
+      // 它的「距上一节点」就是前一天终点开过来的那一段；
+      // 漏掉它的话，重排时刚被置空的 leg_km 会一直空着（里程胶囊消失）。
+      const coveredPoiIds = new Set(legs.map((leg) => leg.toId))
+      for (const leg of legs) {
+        await client.query('UPDATE guide_poi SET leg_km = $1 WHERE id = $2', [
+          Number((leg.distanceM / 1000).toFixed(1)),
+          leg.toId,
+        ])
+      }
+
+      // 每天第一个节点可能一段路都不「到达」它：当天首段导航就是从它开始的，
+      // 跨天转移段（见上）在这种情况下会被刻意跳过。按约定它的 leg_km 是 0，
+      // 得显式写回去 —— 否则它会停在重排时置空的 NULL 上，看起来就是里程数据丢了。
+      for (const day of days) {
+        const firstPoi = pois.find((poi) => poi.day_id === day.id)
+        if (!firstPoi || coveredPoiIds.has(firstPoi.id)) continue
+        await client.query('UPDATE guide_poi SET leg_km = 0 WHERE id = $1', [firstPoi.id])
+      }
+
       // 回填每天的里程与耗时（跨天转移段不计入当日里程）
       for (const day of days) {
         const dayLegs = legs.filter((leg) => leg.dayId === day.id && !leg.transfer)
@@ -901,14 +1144,16 @@ guideRouter.post(
 // ---------------------------------------------------------------------------
 guideRouter.post(
   '/:id/revise/stream',
+  requireUuidParam('id'),
   asyncHandler(async (req, res) => {
     const guideId = req.params.id
-    const { instruction } = req.body as { instruction?: string }
 
-    if (!instruction || !instruction.trim()) {
-      res.status(400).json({ ok: false, error: 'instruction 不能为空' })
-      return
-    }
+    const instruction = requireText(
+      res,
+      (req.body as { instruction?: unknown })?.instruction,
+      'instruction',
+    )
+    if (!instruction) return
 
     const exists = await queryOne<{ id: string }>('SELECT id FROM guide WHERE id = $1', [guideId])
     if (!exists) {
@@ -935,7 +1180,7 @@ guideRouter.post(
     const started = Date.now()
 
     try {
-      const result = await reviseGuide({ guideId, instruction: instruction.trim() }, (event) => {
+      const result = await reviseGuide({ guideId, instruction }, (event) => {
         if (event.type === 'reasoning') {
           send('reasoning', { text: event.text })
         } else if (event.type === 'stage') {
@@ -961,10 +1206,77 @@ guideRouter.post(
 )
 
 // ---------------------------------------------------------------------------
+// POST /api/guide/:id/replan/stream —— AI 重排时间轴（SSE 流式）
+//
+// 与 revise/stream 的区别：这里只调整节点的**顺序 / 所属天 / 到达时间**，
+// 模型只回「节点 id + 建议时间」，服务端据此只更新 day_id/seq/arrive_time，
+// 因此节点既不新增也不删除，只重新安排导航。
+//
+// 请求体可选 { affectedDays: number[] }：只重排这些天（时间轴编辑只改了某一天时用），
+// 其余天原样保留；另外只有「没有停留时长的新节点」允许模型补 stay_minutes / tips。
+//
+// 事件类型：
+//   stage     { stage, message }
+//   reasoning { text }
+//   replan    { guide, summary }  重排完成后的完整攻略与改动统计
+//   error     { message }
+// ---------------------------------------------------------------------------
+guideRouter.post(
+  '/:id/replan/stream',
+  requireUuidParam('id'),
+  asyncHandler(async (req, res) => {
+    const guideId = req.params.id
+
+    const exists = await queryOne<{ id: string }>('SELECT id FROM guide WHERE id = $1', [guideId])
+    if (!exists) {
+      res.status(404).json({ ok: false, error: '攻略不存在' })
+      return
+    }
+
+    // 前端只把「这次真正改动的天」传上来（换了出发 / 住宿地时还会带上相邻的天），
+    // 其余天不参与重排。缺省（不传）则按老行为重排全部天。
+    const { affectedDays } = (req.body ?? {}) as { affectedDays?: unknown }
+    const scopedDays = Array.isArray(affectedDays)
+      ? affectedDays.map((item) => Number(item)).filter((item) => Number.isFinite(item))
+      : undefined
+
+    const { send } = openSseChannel(res)
+
+    try {
+      const result = await replanGuide({ guideId, affectedDays: scopedDays }, (event) => {
+        if (event.type === 'reasoning') {
+          send('reasoning', { text: event.text })
+        } else if (event.type === 'stage') {
+          send('stage', { stage: event.stage, message: event.message })
+        }
+      })
+
+      const guide = await loadGuide(guideId)
+      send('replan', {
+        guide,
+        summary: {
+          total: result.total,
+          movedDays: result.movedDays,
+          reordered: result.reordered,
+          retimed: result.retimed,
+          filled: result.filled,
+        },
+      })
+    } catch (error) {
+      console.error('[replan/stream] 失败：', error)
+      send('error', { message: (error as Error).message || '重排失败' })
+    } finally {
+      if (!res.writableEnded) res.end()
+    }
+  }),
+)
+
+// ---------------------------------------------------------------------------
 // GET /api/guide/:id/text —— 返回攻略手册所需的纯文本结构（后续生成 PDF 用）
 // ---------------------------------------------------------------------------
 guideRouter.get(
   '/:id/text',
+  requireUuidParam('id'),
   asyncHandler(async (req, res) => {
     const guide = await loadGuide(req.params.id)
     if (!guide) {

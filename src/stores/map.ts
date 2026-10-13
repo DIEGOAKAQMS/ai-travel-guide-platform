@@ -19,7 +19,7 @@ export const useMapStore = defineStore('map', () => {
   const viewer = shallowRef<Cesium.Viewer | null>(null)
   const isReady = ref(false)
 
-  /** 当前地图模式：img 卫星 / ter 高程 / vec 矢量 */
+  /** 当前底图：img 卫星 / vec 矢量 */
   const activeBasemap = ref(BASEMAPS[0].key)
 
   /** 状态栏数据 */
@@ -79,7 +79,7 @@ export const useMapStore = defineStore('map', () => {
     fps.value = 0
   }
 
-  /** 切换地图模式：img / ter / vec */
+  /** 切换底图：img / vec */
   function setBasemap(key: string) {
     if (activeBasemap.value === key) return
     activeBasemap.value = key

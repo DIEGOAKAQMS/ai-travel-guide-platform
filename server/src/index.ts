@@ -40,10 +40,28 @@ app.use((_req, res) => {
   res.status(404).json({ ok: false, error: '接口不存在' })
 })
 
-app.use((error: Error, _req: Request, res: Response, _next: NextFunction) => {
-  console.error('[error]', error)
-  res.status(500).json({ ok: false, error: error.message || '服务器内部错误' })
-})
+app.use(
+  (
+    error: Error & { status?: number; statusCode?: number; type?: string },
+    _req: Request,
+    res: Response,
+    _next: NextFunction,
+  ) => {
+    console.error('[error]', error)
+
+    // body-parser 的解析错误自带 4xx 语义（JSON 语法错 / 请求体超限），
+    // 照它的状态码回，别一律 500 —— 「我传的格式不对」和「服务挂了」是两回事。
+    const declared = error.status ?? error.statusCode
+    const status =
+      typeof declared === 'number' && declared >= 400 && declared < 500 ? declared : 500
+
+    let message = error.message || '服务器内部错误'
+    if (status === 400 && error.type === 'entity.parse.failed') message = '请求体不是合法的 JSON'
+    else if (status === 413 || error.type === 'entity.too.large') message = '请求体过大'
+
+    res.status(status).json({ ok: false, error: message })
+  },
+)
 
 async function main(): Promise<void> {
   // 启动时自动建表，保证开箱可用

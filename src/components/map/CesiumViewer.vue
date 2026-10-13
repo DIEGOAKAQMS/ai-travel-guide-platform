@@ -197,8 +197,9 @@ function setupPicking(instance: Cesium.Viewer) {
     const entity = picked?.id as Cesium.Entity | undefined
     // 攻略点位实体的 id 形如 `poi:<uuid>`
     if (!entity || typeof entity.id !== 'string' || !entity.id.startsWith('poi:')) {
-      // 点到空白处 / 路线：收起详情弹窗
+      // 点到空白处 / 路线：收起详情弹窗，并清掉时间轴上的路段高亮
       ui.closePoiPopup()
+      guideStore.clearHighlight()
       return
     }
 
@@ -310,14 +311,18 @@ function setupStats(instance: Cesium.Viewer) {
   })
 }
 
-/** Esc：先取消地图拾取坐标，其次关闭景点详情弹窗 */
+/** Esc：依次取消地图拾取坐标 → 关闭景点详情弹窗 → 清除时间轴上的路段高亮 */
 function onKeydown(event: KeyboardEvent): void {
   if (event.key !== 'Escape') return
   if (ui.pickingPoiKey) {
     ui.cancelPicking()
     return
   }
-  if (ui.poiPopupId) ui.closePoiPopup()
+  if (ui.poiPopupId) {
+    ui.closePoiPopup()
+    return
+  }
+  guideStore.clearHighlight()
 }
 
 onMounted(async () => {

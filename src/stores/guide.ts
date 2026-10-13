@@ -1,10 +1,14 @@
 import { acceptHMRUpdate, defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import {
+  clarifyGuideStream,
   generateGuideStream,
   getGuide,
   planGuideRoute,
+  replanGuideStream,
   reviseGuideStream,
+  saveGuide,
+  type ClarifyQuestion,
   type StreamHandlers,
 } from '@/api/guide'
 import {
@@ -21,8 +25,16 @@ import {
   guideHtmlFileName,
 } from '@/services/guideExport'
 import { clearGuideLayer, flyToGuide, flyToPoi, flyToRoute, renderGuide, type RenderOptions } from '@/services/guideRenderer'
+import { diffAffectedDays } from '@/services/timelineDiff'
 import { useMapStore } from './map'
-import type { GenerateIssue, GeocodeStatus, GuideDto, GuidePoiDto, GuideRouteDto } from '@/types/guide'
+import type {
+  GenerateIssue,
+  GeocodeStatus,
+  GuideDto,
+  GuidePoiDto,
+  GuideRouteDto,
+  GuideSavePayload,
+} from '@/types/guide'
 
 export interface LogLine {
   role: 'user' | 'stage' | 'ok' | 'warn' | 'error'
@@ -47,14 +59,61 @@ export const useGuideStore = defineStore('guide', () => {
   /** 生成过程状态 */
   const generating = ref(false)
   const routing = ref(false)
+  /** 正在让 AI 梳理生成前的澄清问题 */
+  const clarifying = ref(false)
+  /** AI 反问的问题（非空时前端展示问答面板） */
+  const clarifyQuestions = ref<ClarifyQuestion[]>([])
   const stage = ref('')
   const reasoning = ref('')
+
+  /** 推理文本只保留尾部这么多字符：长任务下它会累积到几 MB，白白拖慢渲染 */
+  const REASONING_KEEP = 4000
+
+  /** 追加推理文本（超长就截尾） */
+  function appendReasoning(text: string): void {
+    const next = reasoning.value + text
+    reasoning.value = next.length > REASONING_KEEP ? next.slice(-REASONING_KEEP) : next
+  }
   const poiProgress = ref({ done: 0, total: 0, current: '' })
   const error = ref<string | null>(null)
   const logs = ref<LogLine[]>([])
 
   /** 是否正在导出 HTML（按钮置灰用） */
   const exporting = ref(false)
+
+  /** 时间轴编辑：是否正在保存 + 重排（按钮置灰用） */
+  const savingTimeline = ref(false)
+
+  /**
+   * 是否还有长任务在跑（生成 / 改稿 / 提问 / 路线规划 / 时间轴重排）。
+   *
+   * 各处的「忙」判断过去各写各的，界面上的耗时也就各计各的：
+   * 生成一结束计时器就归零，可后面还在跑路线规划 ——
+   * 用户看到的秒数和结果日志里的耗时永远是两个数。
+   * 这里收敛成一份状态，计时也只剩一个，谁需要就读同一个值。
+   */
+  const busy = computed(
+    () => generating.value || clarifying.value || routing.value || savingTimeline.value,
+  )
+
+  /** 当前这轮任务已经跑了多少秒（busy 期间每秒 +1，闲下来归零） */
+  const elapsedSec = ref(0)
+  let elapsedTimer: number | null = null
+
+  watch(busy, (running) => {
+    if (elapsedTimer !== null) {
+      window.clearInterval(elapsedTimer)
+      elapsedTimer = null
+    }
+    if (!running) return
+
+    const startedAt = Date.now()
+    elapsedSec.value = 0
+    // 每秒才更新一次，不会带来渲染压力
+    elapsedTimer = window.setInterval(() => {
+      elapsedSec.value = Math.floor((Date.now() - startedAt) / 1000)
+    }, 1000)
+  })
 
   /** 被隐藏的天（仅影响地图渲染） */
   const hiddenDays = ref<number[]>([])
@@ -140,14 +199,31 @@ export const useGuideStore = defineStore('guide', () => {
   /**
    * 丢掉已经失效的路段高亮。
    *
-   * 改稿 / 重新规划路线 / 删掉节点后，路线会被整体重建（id 全变了），
-   * 旧的高亮 id 就永远匹配不上任何一段路线 —— 但渲染层只要看到「有高亮」
-   * 就会把其余路线一起淡化，于是整张图的导航线看起来就是变透明了。
+   * 渲染层只要看到「有高亮」就会把其余路线一起淡化，所以一旦这段路根本画不出来，
+   * 屏幕上就是「一段都没亮、整张图的导航线却都变透明」。画不出来有四种情况：
+   *   1. 改稿 / 重新规划路线 / 删掉节点后路线整体重建，id 已不存在；
+   *   2. 它所在的天被隐藏了；
+   *   3. 图例里把「导航路线」/「跨天转移」分类关掉了；
+   *   4. 它是零距离小段，path 只有一个点，本来就不画。
+   *
+   * 这里把状态一并清掉，时间轴上「当前路段」的标记也就跟着复位，不会显示成还在高亮。
    */
   function pruneStaleHighlight(): void {
     const id = highlightedRouteId.value
     if (!id) return
-    if (!guide.value?.routes.some((route) => route.id === id)) highlightedRouteId.value = null
+
+    const route = guide.value?.routes.find((item) => item.id === id)
+    if (!route) {
+      highlightedRouteId.value = null
+      return
+    }
+
+    const day = route.day_id ? guide.value?.days.find((item) => item.id === route.day_id) : null
+    const dayHidden = !!day && hiddenDays.value.includes(day.day_index)
+    const categoryHidden = hiddenCategories.value.includes(route.transfer ? 'transfer' : 'route')
+    const tooShort = !Array.isArray(route.path) || route.path.length < 2
+
+    if (dayHidden || categoryHidden || tooShort) highlightedRouteId.value = null
   }
 
   function applyRender(): void {
@@ -225,15 +301,15 @@ export const useGuideStore = defineStore('guide', () => {
     }
   }
 
-  /** 生成 / 改稿共用的流事件处理器 */
-  function makeStreamHandlers(doneStage: string): StreamHandlers {
+  /** 生成 / 改稿共用的流事件处理器（失败文案按操作区分，别一律说「生成失败」） */
+  function makeStreamHandlers(doneStage: string, failStage: string): StreamHandlers {
     return {
       onStage: ({ message }) => {
         stage.value = message
         pushLog('stage', message)
       },
       onReasoning: ({ text }) => {
-        reasoning.value += text
+        appendReasoning(text)
       },
       onPoi: ({ done, total, name, status }) => {
         poiProgress.value = { done, total, current: name }
@@ -253,28 +329,89 @@ export const useGuideStore = defineStore('guide', () => {
       },
       onError: ({ message }) => {
         error.value = message
-        stage.value = '生成失败'
+        stage.value = failStage
         pushLog('error', message)
       },
     }
   }
 
   /** 处理流式过程中的异常（取消 / 失败）并复位生成状态 */
-  function handleStreamError(caught: unknown, cancelText: string): void {
+  function handleStreamError(caught: unknown, cancelText: string, failStage = '生成失败'): void {
     const err = caught as Error
     if (err.name === 'AbortError') {
       stage.value = '已取消'
       pushLog('warn', cancelText)
     } else {
       error.value = err.message
-      stage.value = '生成失败'
+      stage.value = failStage
       pushLog('error', err.message)
     }
+  }
+
+  /**
+   * 生成攻略前的澄清提问：先让 AI 反问几个关键问题。
+   *
+   * 返回问题列表供前端展示；用户答完后把答案拼进 prompt，再调 generate()。
+   * 失败、取消或已有任务在跑时返回 null。
+   */
+  async function clarify(prompt: string): Promise<ClarifyQuestion[] | null> {
+    if (clarifying.value || generating.value || routing.value) return null
+
+    clarifying.value = true
+    clarifyQuestions.value = []
+    error.value = null
+    reasoning.value = ''
+    stage.value = '正在梳理还需要确认的信息…'
+    logs.value = []
+    pushLog('user', prompt)
+
+    controller = new AbortController()
+    let result: ClarifyQuestion[] | null = null
+
+    try {
+      await clarifyGuideStream(
+        prompt,
+        {
+          onStage: ({ message }) => {
+            stage.value = message
+          },
+          onReasoning: ({ text }) => {
+            appendReasoning(text)
+          },
+          onClarify: ({ questions }) => {
+            result = questions
+            clarifyQuestions.value = questions
+            pushLog('ok', `排行程前想先确认 ${questions.length} 件事`)
+          },
+          onError: ({ message }) => {
+            error.value = message
+            pushLog('error', message)
+          },
+        },
+        controller.signal,
+      )
+    } catch (caught) {
+      handleStreamError(caught, '已取消提问', '提问失败')
+    } finally {
+      clarifying.value = false
+      controller = null
+    }
+
+    return result
+  }
+
+  /** 收起诉求澄清面板（保留用户已输入的内容由调用方处理） */
+  function clearClarify(): void {
+    clarifyQuestions.value = []
   }
 
   /** 一句话生成攻略（流式），完成后自动规划路线 */
   async function generate(prompt: string, options?: { days?: number; region?: string }): Promise<void> {
     if (generating.value) return
+
+    // 留一份当前攻略：本次生成失败 / 被取消时要还回去，
+    // 否则一次没跑成的生成会把用户正在看的攻略一起弄丢（数据库里还在，但界面空了）。
+    const previous = guide.value
 
     generating.value = true
     error.value = null
@@ -282,12 +419,13 @@ export const useGuideStore = defineStore('guide', () => {
     stage.value = '正在连接服务…'
     reasoning.value = ''
     poiProgress.value = { done: 0, total: 0, current: '' }
+    clarifyQuestions.value = []
     hiddenDays.value = []
     hiddenCategories.value = []
     highlightedRouteId.value = null
     selectedPoiId.value = null
     logs.value = []
-    // 清掉上一份结果，避免本次失败时误渲染旧攻略
+    // 清掉上一份结果，避免生成期间误渲染旧攻略
     guide.value = null
     clearGuideLayer(mapStore.viewer)
 
@@ -297,17 +435,24 @@ export const useGuideStore = defineStore('guide', () => {
     try {
       await generateGuideStream(
         { prompt, days: options?.days, region: options?.region },
-        makeStreamHandlers('攻略生成完成'),
+        makeStreamHandlers('攻略生成完成', '生成失败'),
         controller.signal,
       )
     } catch (caught) {
-      handleStreamError(caught, '已取消生成')
+      handleStreamError(caught, '已取消生成', '生成失败')
     } finally {
       generating.value = false
       controller = null
     }
 
-    if (!guide.value) return
+    if (!guide.value) {
+      // 没拿到新结果：把原来那份放回去，至少别让界面变成空的
+      if (previous) {
+        guide.value = previous
+        applyRender()
+      }
+      return
+    }
 
     applyRender()
     flyToGuide(mapStore.viewer, guide.value)
@@ -340,11 +485,11 @@ export const useGuideStore = defineStore('guide', () => {
       await reviseGuideStream(
         current.id,
         instruction,
-        makeStreamHandlers('改稿完成'),
+        makeStreamHandlers('改稿完成', '改稿失败'),
         controller.signal,
       )
     } catch (caught) {
-      handleStreamError(caught, '已取消改稿')
+      handleStreamError(caught, '已取消改稿', '改稿失败')
     } finally {
       generating.value = false
       controller = null
@@ -390,6 +535,104 @@ export const useGuideStore = defineStore('guide', () => {
   /** 取消进行中的生成 */
   function cancel(): void {
     controller?.abort()
+  }
+
+  /**
+   * 时间轴编辑后的「保存 + 让 AI 重新规划」。
+   *
+   * 三步串行：
+   *   1. 把编辑后的整条时间轴写回数据库（PUT /api/guide/:id）
+   *   2. 让 AI 重新编排各节点的顺序 / 所属天 / 到达时间
+   *      —— 只重排导航，不新增也不删除任何节点
+   *   3. 按新顺序重新规划驾车路线，并用真实里程 / 耗时刷新时间轴
+   */
+  async function saveTimelineAndReplan(payload: GuideSavePayload): Promise<boolean> {
+    const current = guide.value
+    if (!current || savingTimeline.value || generating.value || routing.value) return false
+
+    savingTimeline.value = true
+    error.value = null
+    reasoning.value = ''
+    stage.value = '正在保存时间轴…'
+    highlightedRouteId.value = null
+    selectedPoiId.value = null
+    pushLog('stage', '正在保存时间轴改动…')
+
+    // 保存与 AI 重排是两件不同的事，出错时文案要指到真正失败的那一步
+    let phase: 'save' | 'replan' = 'save'
+
+    try {
+      // 先和保存前的数据比一遍：只重排「这次真正改了的那几天」，
+      // 其余天原样保留（换了出发 / 住宿地时，前后一天也会被带上）
+      const affectedDays = diffAffectedDays(current, payload)
+
+      const saved = await saveGuide(current.id, payload)
+      guide.value = saved
+      applyRender()
+      pushLog('ok', '时间轴已保存')
+
+      phase = 'replan'
+      if (affectedDays.length === 0) {
+        pushLog('stage', '时间轴没有结构性改动，跳过 AI 重排')
+      } else {
+        stage.value = `正在让 AI 重新编排第 ${affectedDays.join('、')} 天…`
+        pushLog('stage', `只重排被改动的第 ${affectedDays.join('、')} 天，其余天保持不变`)
+        await replanGuideStream(
+          current.id,
+          {
+            onStage: ({ message }) => {
+              stage.value = message
+              pushLog('stage', message)
+            },
+            onReasoning: ({ text }) => {
+              appendReasoning(text)
+            },
+            onReplan: ({ guide: replanned, summary }) => {
+              guide.value = replanned
+              const parts = [
+                summary.movedDays > 0 ? `${summary.movedDays} 个节点换了天` : '',
+                summary.reordered > 0 ? `${summary.reordered} 个节点调整了顺序` : '',
+                summary.retimed > 0 ? `${summary.retimed} 个节点时间更新` : '',
+                summary.filled > 0 ? `${summary.filled} 个新节点补上了游玩时长` : '',
+              ].filter(Boolean)
+              pushLog(
+                'ok',
+                parts.length > 0
+                  ? `AI 重排完成：${parts.join('，')}（共 ${summary.total} 个节点）`
+                  : `AI 重排完成：${summary.total} 个节点顺序已是最优`,
+              )
+            },
+            onError: ({ message }) => {
+              error.value = message
+              stage.value = '重排失败'
+              pushLog('error', `重排失败：${message}`)
+            },
+          },
+          undefined,
+          affectedDays,
+        )
+      }
+
+      if (error.value) return false
+
+      applyRender()
+      await planRoutes()
+      return true
+    } catch (caught) {
+      const err = caught as Error
+      const label = phase === 'replan' ? '重排失败' : '保存失败'
+      if (err.name === 'AbortError') {
+        stage.value = '已取消'
+        pushLog('warn', phase === 'replan' ? '已取消重新规划' : '已取消保存时间轴')
+      } else {
+        error.value = err.message
+        stage.value = label
+        pushLog('error', `${label}：${err.message}`)
+      }
+      return false
+    } finally {
+      savingTimeline.value = false
+    }
   }
 
   /** 载入已有攻略 */
@@ -570,12 +813,17 @@ export const useGuideStore = defineStore('guide', () => {
     issues,
     generating,
     routing,
+    clarifying,
+    busy,
+    elapsedSec,
+    clarifyQuestions,
     stage,
     reasoning,
     poiProgress,
     error,
     logs,
     exporting,
+    savingTimeline,
     hiddenDays,
     hiddenCategories,
     startPoiId,
@@ -586,7 +834,10 @@ export const useGuideStore = defineStore('guide', () => {
     generate,
     revise,
     planRoutes,
+    saveTimelineAndReplan,
     cancel,
+    clarify,
+    clearClarify,
     loadGuide,
     setGuide,
     reset,

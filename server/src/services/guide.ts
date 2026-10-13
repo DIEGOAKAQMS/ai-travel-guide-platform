@@ -2,7 +2,13 @@ import { bboxForRegion } from '../config'
 import { query, queryOne, withTransaction } from '../db/pool'
 import { mapLimit } from '../utils/async'
 import { geocodeAddress, searchPoi, type PlaceCandidate } from './amap'
-import { planGuideStream, reviseGuideStream } from './llm'
+import {
+  planGuideStream,
+  replanGuideStream,
+  reviseGuideStream,
+  type ChatUsage,
+  type ReplanDayInput,
+} from './llm'
 import { geocodeByTianditu } from './tianditu'
 import type {
   Bbox,
@@ -152,6 +158,61 @@ function stitchDays(days: LlmDay[]): void {
   }
 }
 
+/**
+ * 次日的「XX 出发」直接复用前一晚「XX 住宿」已经落好的坐标。
+ *
+ * 为什么必须复用：drive 节点按提示词的规范不带 city，落点时就少了一条最有效的
+ * 「行政区前缀 + 结构化地理编码」路径。实测「新龙县城住宿」定位成功，
+ * 次日同一个地方的「新龙县城出发」却 failed —— 当天首段导航整段丢失，
+ * 只能靠 TRANSFER 段（拿前一天终点兜底）拼出来，时间轴和地图对不上。
+ * 复用顺带还能消掉住宿 / 出发点位之间几百米的抖动。
+ */
+function reuseDepartureCoords(
+  results: { resolved: ResolvedNode; issue?: GenerateIssue }[],
+  flat: { node: LlmNode; dayIndex: number; seq: number }[],
+): void {
+  const known = new Map<string, ResolvedNode>()
+
+  results.forEach((item, index) => {
+    const node = flat[index]?.node
+    if (!node) return
+
+    // 键用 mainName 而不是 coreName：次日出发地常被模型简写。
+    // 实测「甘孜县城住宿」（D7 末站）→ 次日写成「甘孜出发」：coreName 得到
+    // 「甘孜县城」≠「甘孜」，复用落空，于是「甘孜」被单独拿去检索，落到了
+    // 甘孜州州府康定（101.96,30.05）—— 和前一晚住宿差了 180 km，当天首段
+    // 车程被算成 ~8 小时、行程一路排到 23:10。
+    // mainName 会再削掉「县城 / 镇 / 市区」这类通用后缀，两边都归到「甘孜」，命中复用。
+    const key = mainName(node.name)
+    const departure = departurePlaceName(node.name, normalizeKind(node.kind)) !== null
+    const prev = key ? known.get(key) : undefined
+
+    if (departure && prev && prev.geocode_status === 'ok' && prev.lng != null && prev.lat != null) {
+      results[index] = {
+        resolved: {
+          ...item.resolved,
+          address: prev.address,
+          lng: prev.lng,
+          lat: prev.lat,
+          lng_gcj: prev.lng_gcj,
+          lat_gcj: prev.lat_gcj,
+          photos: prev.photos,
+          geocode_status: 'ok',
+          geocode_score: prev.geocode_score,
+          geocode_provider: prev.geocode_provider,
+          geocode_keyword: prev.geocode_keyword,
+        },
+      }
+      console.log(`[guide] 「${node.name}」复用「${prev.name}」的坐标`)
+    }
+
+    const current = results[index].resolved
+    if (key && current.geocode_status === 'ok' && current.lng != null && current.lat != null) {
+      known.set(key, current)
+    }
+  })
+}
+
 /** 从「四川省甘孜州稻城县」中抽出可用于高德 city 参数的「甘孜州」 */
 export function shortCity(fullAddress?: string): string | undefined {
   if (!fullAddress) return undefined
@@ -165,15 +226,127 @@ function insideBbox(lng: number, lat: number, bbox: Bbox): boolean {
   return lng >= bbox.minLng && lng <= bbox.maxLng && lat >= bbox.minLat && lat <= bbox.maxLat
 }
 
-/** 在候选集中优先取落在区域内的，取不到再退而求其次 */
+/**
+ * 通用地点后缀：比对候选与关键词时先削掉。
+ *
+ * 不削的话「喇荣沟观景台」会和康定的「玉岭观雪-观景台」因为共享「观景台」而被当成同一处，
+ * 400 km 外的错点就被当成 ok 收下（实测就是它把 D4 的车程抬到 6 小时）。
+ */
+const GENERIC_PLACE_TAIL =
+  /(观景平台|观景台|观景点|垭口|山口|景区|景点|服务区|停车区|古镇|古城|县城|城区|市区)$/
+
+/** 去掉通用后缀的地名主干；削剩下不足两字就退回原名（「泸定桥」这类短名不能被削空） */
+function mainName(raw: string): string {
+  const base = coreName(raw)
+  const trimmed = base.replace(GENERIC_PLACE_TAIL, '')
+  return trimmed.length >= 2 ? trimmed : base
+}
+
+/** 从「四川省甘孜州色达县」里取出区县名「色达县」（高德候选的 district 就是这一级） */
+function districtOf(city?: string): string | undefined {
+  if (!city) return undefined
+  const matched = /([^省市州盟]+(?:县|区|市|旗))$/.exec(city.trim())
+  return matched && matched[1].length >= 2 ? matched[1] : undefined
+}
+
+/** 地名主干的二元字组：用来容忍「海子山姊妹湖」↔「姊妹海海子山观景台」这种词序颠倒 */
+function bigrams(text: string): Set<string> {
+  const grams = new Set<string>()
+  for (let i = 0; i + 1 < text.length; i += 1) grams.add(text.slice(i, i + 2))
+  return grams
+}
+
+/** 两个字组集合的重合度（以较短一方为分母） */
+function overlapRatio(a: string, b: string): number {
+  if (a.length < 2 || b.length < 2) return 0
+  const short = a.length <= b.length ? a : b
+  const long = a.length <= b.length ? b : a
+  const longGrams = bigrams(long)
+  let hit = 0
+  for (const gram of bigrams(short)) if (longGrams.has(gram)) hit += 1
+  return hit / Math.max(short.length - 1, 1)
+}
+
+/**
+ * 候选名与检索词是否像指同一处。
+ *
+ * 先看地名主干是否互相包含；不含但字组重合度过半也认 ——
+ * 「海子山姊妹湖」真正对应的 POI 叫「姊妹海海子山观景台」，词序是倒的，
+ * 只判包含会把它误杀（而它正是姊妹湖路边那个观景台）。
+ * 「喇荣沟」对上康定的「玉岭观雪」重合度是 0，「雅砻江大峡谷」对上丹巴的
+ * 「甲居藏寨大峡谷9号观景台」只有「大峡谷」两个字组，都过不了这一关。
+ */
+const NAME_OVERLAP_THRESHOLD = 0.6
+
+function nameMatches(candidate: PlaceCandidate, keyword: string): boolean {
+  const a = mainName(candidate.name)
+  const b = mainName(keyword)
+  if (a.length < 2 || b.length < 2) return false
+  if (a.includes(b) || b.includes(a)) return true
+  return overlapRatio(a, b) >= NAME_OVERLAP_THRESHOLD
+}
+
+/** 候选取不到 district 时退回 city 比对：区县一致就认为落对了地方 */
+function adminMatches(candidate: PlaceCandidate, district?: string): boolean {
+  if (!district) return false
+  const got = `${candidate.district ?? ''}${candidate.city ?? ''}`
+  return got.length >= 2 && (got.includes(district) || district.includes(got))
+}
+
+/**
+ * 候选是否「像」这次要搜的地方：名字对得上，或行政区对得上，满足其一即可。
+ *
+ * 为什么必须校验：高德 /place/text 是模糊匹配，搜不到时不会返回空，
+ * 而是塞回一堆同类 POI —— 搜「喇荣沟观景台」回来的是康定的「玉岭观雪-观景台」，
+ * 搜「雅砻江大峡谷观景台」回来的是丹巴的「甲居藏寨大峡谷9号观景台」。
+ * 而「川西」这种大区域的 bbox 有 700 km 宽，光靠范围校验根本兜不住这种偏差。
+ * 宁可判成 unresolved（时间轴上会亮出待校正），也不能默默收下一个几百公里外的错点。
+ */
+export function isRelevantCandidate(
+  candidate: PlaceCandidate,
+  keyword: string,
+  district?: string,
+): boolean {
+  return nameMatches(candidate, keyword) || adminMatches(candidate, district)
+}
+
+/**
+ * 在候选集里挑一个落点。
+ *
+ * 先用相关性筛掉高德模糊匹配塞回来的无关 POI，再按优先级取：
+ * 区内且行政区对得上 → 区内且名字对得上 → 区外（交给调用方标 suspect）。
+ */
 function pickCandidate(
   candidates: PlaceCandidate[],
   bbox: Bbox,
+  filter: { keyword: string; district?: string },
 ): { candidate: PlaceCandidate; inBbox: boolean } | null {
   if (candidates.length === 0) return null
-  const inside = candidates.find((item) => insideBbox(item.lng, item.lat, bbox))
-  if (inside) return { candidate: inside, inBbox: true }
-  return { candidate: candidates[0], inBbox: false }
+
+  const usable = candidates
+    .map((candidate) => ({
+      candidate,
+      nameOk: nameMatches(candidate, filter.keyword),
+      adminOk: adminMatches(candidate, filter.district),
+      inBbox: insideBbox(candidate.lng, candidate.lat, bbox),
+    }))
+    .filter((item) => item.nameOk || item.adminOk)
+
+  if (usable.length === 0) {
+    console.warn(
+      `[guide] 「${filter.keyword}」的候选全都不相关，已丢弃：` +
+        candidates.map((item) => item.name).join(' / '),
+    )
+    return null
+  }
+
+  const pick =
+    usable.find((item) => item.inBbox && item.adminOk) ??
+    usable.find((item) => item.inBbox && item.nameOk) ??
+    usable.find((item) => item.adminOk) ??
+    usable[0]
+
+  return { candidate: pick.candidate, inBbox: pick.inBbox }
 }
 
 /** 两点间球面距离（米） */
@@ -308,6 +481,8 @@ export async function refineOutliers(
 interface Attempt {
   /** 用于追溯的关键词 */
   label: string
+  /** 这次实际拿去检索的地名（「甘孜州色达县城」这种带前缀的和裸词要分别校验） */
+  keyword: string
   run: () => Promise<PlaceCandidate[]>
 }
 
@@ -388,6 +563,9 @@ async function resolveNode(
     ? []
     : [...derived.slice(1), ...(keyword !== node.name ? [node.name] : [])]
   const city = shortCity(node.city) ?? node.city
+  // 区县一级用于校验候选是否落在同一个县：city 被 shortCity 截成「甘孜州」了，
+  // 只能用原始 node.city 取区县
+  const district = districtOf(node.city)
   const attempts: Attempt[] = []
 
   /**
@@ -406,6 +584,7 @@ async function resolveNode(
     const pushGeocode = (label: string, address: string) => {
       attempts.push({
         label,
+        keyword: target,
         run: async () => {
           const one = await geocodeAddress(address)
           return one ? [one] : []
@@ -415,6 +594,7 @@ async function resolveNode(
     const pushPoi = (label: string, withCity: boolean) => {
       attempts.push({
         label,
+        keyword: target,
         run: () => searchPoi(target, withCity ? { city, limit: 5 } : { limit: 5 }),
       })
     }
@@ -444,7 +624,7 @@ async function resolveNode(
       continue
     }
 
-    const picked = pickCandidate(candidates, bbox)
+    const picked = pickCandidate(candidates, bbox, { keyword: attempt.keyword, district })
     if (!picked) continue
 
     if (picked.inBbox) {
@@ -605,7 +785,74 @@ export async function generateGuide(
     message: `行程骨架完成，共 ${llmGuide.days.length} 天`,
   })
 
-  const region = input.region ?? llmGuide.region
+  const { guideId, issues, resolvedNodes } = await locateAndPersist(
+    llmGuide,
+    { prompt: input.prompt, region: input.region },
+    onEvent,
+  )
+
+  onEvent?.({ type: 'stage', stage: 'done', message: '攻略生成完成' })
+
+  return { guideId, issues, stats: { ...summarizeGeocode(resolvedNodes), usage } }
+}
+
+/**
+ * 导入一份「已经写好」的攻略 JSON（不调用 LLM，只做落点 + 入库）。
+ *
+ * 与 `generateGuide` 的差别只有「内容从哪来」：LLM 那一步被换成外部传入的
+ * `llmGuide`，后面的跨日衔接修复、逐个落点、离群复核、写库完全走同一条路径 ——
+ * 否则导进来的攻略会出现「时间轴断成两截」「点位飞到外省」这类只有生成路径才修的问题。
+ *
+ * 用法见 `scripts/import-guide.ts`。
+ */
+export async function importGuide(
+  llmGuide: LlmGuide,
+  meta?: { prompt?: string | null; region?: string | null; title?: string | null },
+  onEvent?: (event: GenerateEvent) => void,
+): Promise<GenerateResult> {
+  if (!Array.isArray(llmGuide?.days) || llmGuide.days.length === 0) {
+    throw new Error('攻略 JSON 缺少非空的 days 数组，无法导入')
+  }
+  if (meta?.title) llmGuide.title = meta.title
+  llmGuide.total_days = llmGuide.total_days ?? llmGuide.days.length
+
+  onEvent?.({
+    type: 'stage',
+    stage: 'planned',
+    message: `导入内容就绪，共 ${llmGuide.days.length} 天`,
+  })
+
+  const { guideId, issues, resolvedNodes } = await locateAndPersist(
+    llmGuide,
+    { prompt: meta?.prompt ?? null, region: meta?.region },
+    onEvent,
+  )
+
+  onEvent?.({ type: 'stage', stage: 'done', message: '攻略导入完成' })
+
+  // 没有调 LLM，用量一律记 0
+  return {
+    guideId,
+    issues,
+    stats: {
+      ...summarizeGeocode(resolvedNodes),
+      usage: { promptTokens: 0, completionTokens: 0, reasoningTokens: 0 },
+    },
+  }
+}
+
+/**
+ * 落点 + 入库的公共尾段，`generateGuide` 与 `importGuide` 共用。
+ *
+ * 顺序不能动：先 `stitchDays` 补跨日衔接（否则落点列表里缺当天的起点节点），
+ * 再并发落点，最后才做离群复核与「出发地复用住宿坐标」。
+ */
+async function locateAndPersist(
+  llmGuide: LlmGuide,
+  meta: { prompt: string | null; region?: string | null },
+  onEvent?: (event: GenerateEvent) => void,
+): Promise<{ guideId: string; issues: GenerateIssue[]; resolvedNodes: ResolvedNode[] }> {
+  const region = meta.region ?? llmGuide.region
   const [minLng, minLat, maxLng, maxLat] = bboxForRegion(region)
   const bbox: Bbox = { minLng, minLat, maxLng, maxLat }
 
@@ -645,6 +892,9 @@ export async function generateGuide(
   // 跨省长串点复核（区域名陌生时 bbox 会退化成全国，这一步兜住）
   await refineOutliers(results, flat, bbox)
 
+  // 复核之后再对齐一次「XX出发」的坐标：它与前一晚住宿本来就是同一个点
+  reuseDepartureCoords(results, flat)
+
   const resolvedNodes = results.map((item) => item.resolved)
   const issues = results
     .map((item) => item.issue)
@@ -653,27 +903,25 @@ export async function generateGuide(
   onEvent?.({ type: 'stage', stage: 'persisting', message: '正在写入数据库…' })
 
   const guideId = await persistGuide({
-    title: llmGuide.title || input.prompt.slice(0, 50),
+    title: llmGuide.title || (meta.prompt ?? '未命名攻略').slice(0, 50),
     region: region ?? null,
-    prompt: input.prompt,
+    prompt: meta.prompt ?? '',
     summary: llmGuide.summary ?? null,
     llmGuide,
     resolvedNodes,
   })
 
-  onEvent?.({ type: 'stage', stage: 'done', message: '攻略生成完成' })
+  return { guideId, issues, resolvedNodes }
+}
 
+/** 按落点状态统计，`generateGuide` 与 `importGuide` 共用 */
+function summarizeGeocode(resolvedNodes: ResolvedNode[]): Omit<GenerateResult['stats'], 'usage'> {
   return {
-    guideId,
-    issues,
-    stats: {
-      totalNodes: resolvedNodes.length,
-      okCount: resolvedNodes.filter((item) => item.geocode_status === 'ok').length,
-      suspectCount: resolvedNodes.filter((item) => item.geocode_status === 'suspect').length,
-      failedCount: resolvedNodes.filter((item) => item.geocode_status === 'failed').length,
-      skippedCount: resolvedNodes.filter((item) => item.geocode_status === 'skipped').length,
-      usage,
-    },
+    totalNodes: resolvedNodes.length,
+    okCount: resolvedNodes.filter((item) => item.geocode_status === 'ok').length,
+    suspectCount: resolvedNodes.filter((item) => item.geocode_status === 'suspect').length,
+    failedCount: resolvedNodes.filter((item) => item.geocode_status === 'failed').length,
+    skippedCount: resolvedNodes.filter((item) => item.geocode_status === 'skipped').length,
   }
 }
 
@@ -1066,6 +1314,9 @@ export async function reviseGuide(
   // 跨省长串点复核（区域名陌生时 bbox 会退化成全国，这一步兜住）
   await refineOutliers(results, flat, bbox)
 
+  // 改稿同样要保证「XX出发」与前一晚住宿落在同一个点
+  reuseDepartureCoords(results, flat)
+
   const resolvedNodes = results.map((item) => item.resolved)
   const issues = results
     .map((item) => item.issue)
@@ -1097,4 +1348,272 @@ export async function reviseGuide(
       usage,
     },
   }
+}
+
+// ---------------------------------------------------------------------------
+// 时间轴重排：读取时间轴上的全部节点 → 交给模型重排「顺序 / 所属天 / 到达时间」
+//
+// 与 reviseGuide 的关键区别：这里**不允许**增删或改写任何节点内容。
+// 模型只回「节点 id + 建议时间」，服务端据此只更新 day_id / seq / arrive_time，
+// 因此节点集合恒定不变 —— 这是「只重新安排导航、不许增删」的硬保证。
+// ---------------------------------------------------------------------------
+
+export interface ReplanInput {
+  guideId: string
+  /**
+   * 只重排这些天（day_index）；为空表示按老行为重排全部天。
+   *
+   * 时间轴编辑模式只会改动某一天（或因为换了出发 / 住宿地而牵动相邻的天），
+   * 其余天必须原样保留 —— 否则用户只加了一个景点，AI 却把整份行程都重排了一遍。
+   */
+  affectedDays?: number[]
+}
+
+export interface ReplanResult {
+  /** 时间轴上的节点总数 */
+  total: number
+  /** 被换到其它天的节点数 */
+  movedDays: number
+  /** 仍在本天、但先后顺序被调整的节点数 */
+  reordered: number
+  /** 到达时间被改写的节点数 */
+  retimed: number
+  /** 补全了停留时长 / 建议的新节点数 */
+  filled: number
+  usage: ChatUsage
+}
+
+/** 允许 AI 补停留时长的节点类型（赶路 / 住宿这类本来就没有「游玩时长」） */
+const FILLABLE_KINDS = new Set(['spot', 'view', 'town', 'meal', 'rest'])
+
+/** 停留时长的合理区间（分钟）：模型给的数落在这之外就丢弃 */
+const STAY_MINUTES_RANGE = { min: 15, max: 300 }
+
+/** 'HH:mm' 归一化：'8:5' → '08:05'；非法或缺失返回 null */
+function normalizeClock(value: string | undefined): string | null {
+  const matched = /^(\d{1,2}):(\d{1,2})$/.exec((value ?? '').trim())
+  if (!matched) return null
+  const hours = Number(matched[1])
+  const minutes = Number(matched[2])
+  if (hours > 23 || minutes > 59) return null
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`
+}
+
+export async function replanGuide(
+  input: ReplanInput,
+  onEvent?: (event: GenerateEvent) => void,
+): Promise<ReplanResult> {
+  onEvent?.({ type: 'stage', stage: 'loading', message: '正在读取当前时间轴…' })
+
+  const dayRows = await query<{ id: string; day_index: number }>(
+    'SELECT id, day_index FROM guide_day WHERE guide_id = $1 ORDER BY day_index',
+    [input.guideId],
+  )
+  if (dayRows.length === 0) throw new Error('攻略不存在或没有行程天')
+
+  // 用户最初的需求（原始想法 + 澄清答案）落在 guide.prompt 里，必须一并交给模型：
+  // 重排只让模型回「节点 id + 时间」，它看不到需求时就会把「尽量 9 点出发」这类
+  // 偏好按默认"合理时段"一律改掉（实测：raw_llm 里每天 09:00 出发，重排一轮后
+  // 整份行程被改成 07:30 / 08:00 出发，连该早起看日出的那天也不例外）。
+  const requirement = await queryOne<{ prompt: string | null }>(
+    'SELECT prompt FROM guide WHERE id = $1',
+    [input.guideId],
+  )
+
+  const poiRows = await query<{
+    id: string
+    day_id: string | null
+    seq: number
+    name: string
+    kind: string
+    arrive_time: string | null
+    stay_minutes: number | null
+    tips: string | null
+    lng: number | null
+    lat: number | null
+  }>(
+    `SELECT p.id, p.day_id, p.seq, p.name, p.kind, p.arrive_time, p.stay_minutes, p.tips, p.lng, p.lat
+       FROM guide_poi p
+       JOIN guide_day d ON d.id = p.day_id
+      WHERE p.guide_id = $1
+      ORDER BY d.day_index, p.seq`,
+    [input.guideId],
+  )
+  if (poiRows.length === 0) throw new Error('当前时间轴上没有任何节点')
+
+  const dayIdByIndex = new Map(dayRows.map((day) => [day.day_index, day.id]))
+  const dayIndexById = new Map(dayRows.map((day) => [day.id, day.day_index]))
+  const firstDayIndex = dayRows[0].day_index
+
+  /** 节点当前的所属天（用于「有没有换天」的统计与兜底） */
+  const originalDayIndex = new Map<string, number>(
+    poiRows.map((poi) => [
+      poi.id,
+      (poi.day_id ? dayIndexById.get(poi.day_id) : undefined) ?? firstDayIndex,
+    ]),
+  )
+  const originalSeq = new Map(poiRows.map((poi) => [poi.id, poi.seq]))
+  const originalTime = new Map(poiRows.map((poi) => [poi.id, poi.arrive_time]))
+
+  // 只把「受影响的天」交给模型。其余天不进 prompt，模型既看不到也动不到。
+  const requested = (input.affectedDays ?? []).filter((dayIndex) => dayIdByIndex.has(dayIndex))
+  const scoped = requested.length > 0 ? new Set(requested) : null
+  if (input.affectedDays?.length && scoped === null) {
+    console.warn(
+      `[guide] 指定的天 ${input.affectedDays.join('、')} 在攻略里不存在，退化为全量重排`,
+    )
+  }
+
+  const isFillable = (poi: { kind: string; stay_minutes: number | null }): boolean =>
+    poi.stay_minutes === null && FILLABLE_KINDS.has(poi.kind)
+  const fillableIds = new Set(poiRows.filter(isFillable).map((poi) => poi.id))
+
+  const payloadDays: ReplanDayInput[] = dayRows
+    .filter((day) => scoped === null || scoped.has(day.day_index))
+    .map((day) => ({
+      day_index: day.day_index,
+      nodes: poiRows
+        .filter((poi) => poi.day_id === day.id)
+        .map((poi) => ({
+          id: poi.id,
+          name: poi.name,
+          kind: poi.kind,
+          time: poi.arrive_time ?? undefined,
+          stay_minutes: poi.stay_minutes ?? undefined,
+          lng: num(poi.lng) ?? undefined,
+          lat: num(poi.lat) ?? undefined,
+          // 只有「用户刚加进来、还没填停留时长」的点允许模型补全
+          fill_stay: isFillable(poi) ? true : undefined,
+        })),
+    }))
+
+  const scopedNodes = payloadDays.reduce((sum, day) => sum + day.nodes.length, 0)
+  const scopeText =
+    scoped === null ? '全部行程' : `第 ${[...scoped].sort((a, b) => a - b).join('、')} 天`
+
+  onEvent?.({
+    type: 'stage',
+    stage: 'planning',
+    message: `正在让 AI 重新编排${scopeText}的 ${scopedNodes} 个节点…`,
+  })
+
+  const { plan, usage } = await replanGuideStream(
+    payloadDays,
+    (delta) => {
+      if (delta.reasoning) onEvent?.({ type: 'reasoning', text: delta.reasoning })
+    },
+    requirement?.prompt ?? undefined,
+  )
+
+  // 宽容合并，但保证「节点不增不减」：
+  // - 模型漏掉的节点，按原天补回该天末尾；
+  // - 模型编造的 id / 不存在的天，直接丢弃。
+  const knownIds = new Set(poiRows.map((poi) => poi.id))
+  const placed = new Set<string>()
+  const seqByDay = new Map<number, number>()
+  const assignments: { id: string; dayIndex: number; seq: number; time: string | null }[] = []
+
+  const assign = (id: string, dayIndex: number, time: string | null): void => {
+    const seq = seqByDay.get(dayIndex) ?? 0
+    seqByDay.set(dayIndex, seq + 1)
+    placed.add(id)
+    assignments.push({ id, dayIndex, seq, time })
+  }
+
+  for (const day of plan.days) {
+    if (!dayIdByIndex.has(day.day_index)) continue
+    for (const node of day.nodes) {
+      if (!knownIds.has(node.id) || placed.has(node.id)) continue
+      assign(node.id, day.day_index, normalizeClock(node.time))
+    }
+  }
+  for (const poi of poiRows) {
+    if (!placed.has(poi.id)) assign(poi.id, originalDayIndex.get(poi.id) ?? firstDayIndex, null)
+  }
+
+  let movedDays = 0
+  let reordered = 0
+  let retimed = 0
+  for (const item of assignments) {
+    if (originalDayIndex.get(item.id) !== item.dayIndex) movedDays += 1
+    else if (originalSeq.get(item.id) !== item.seq) reordered += 1
+    if (item.time !== null && item.time !== originalTime.get(item.id)) retimed += 1
+  }
+
+  onEvent?.({ type: 'stage', stage: 'persisting', message: '正在写回重排结果…' })
+
+  // 新节点的补全：只认「这次确实标了 fill_stay」的节点，且只写本来为空的字段，
+  // 模型对既有节点多嘴给的 stay_minutes / tips 一律丢弃。
+  const fillById = new Map<string, { stay_minutes?: number; tips?: string }>()
+  for (const day of plan.days) {
+    for (const node of day.nodes) {
+      if (!fillableIds.has(node.id)) continue
+      const patch: { stay_minutes?: number; tips?: string } = {}
+      if (node.stay_minutes !== undefined) {
+        const stay = Math.round(node.stay_minutes)
+        if (stay >= STAY_MINUTES_RANGE.min && stay <= STAY_MINUTES_RANGE.max) {
+          patch.stay_minutes = stay
+        }
+      }
+      const tips = node.tips?.trim()
+      if (tips) patch.tips = tips.slice(0, 60)
+      if (patch.stay_minutes !== undefined || patch.tips !== undefined) {
+        fillById.set(node.id, patch)
+      }
+    }
+  }
+
+  let filled = 0
+
+  await withTransaction(async (client) => {
+    for (const item of assignments) {
+      const dayId = dayIdByIndex.get(item.dayIndex)
+      if (!dayId) continue
+      await client.query(
+        `UPDATE guide_poi
+            SET day_id = $1, seq = $2, arrive_time = COALESCE($3, arrive_time)
+          WHERE id = $4 AND guide_id = $5`,
+        [dayId, item.seq, item.time, item.id, input.guideId],
+      )
+    }
+
+    for (const [id, patch] of fillById) {
+      const sets: string[] = []
+      const params: unknown[] = []
+      if (patch.stay_minutes !== undefined) {
+        params.push(patch.stay_minutes)
+        sets.push(`stay_minutes = $${params.length}`)
+      }
+      if (patch.tips !== undefined) {
+        params.push(patch.tips)
+        sets.push(`tips = $${params.length}`)
+      }
+      params.push(id, input.guideId)
+      const updated = await client.query(
+        `UPDATE guide_poi
+            SET ${sets.join(', ')}
+          WHERE id = $${params.length - 1} AND guide_id = $${params.length}
+            AND stay_minutes IS NULL`,
+        params,
+      )
+      filled += updated.rowCount ?? 0
+    }
+
+    // 顺序变了，模型当初估的「距上一节点里程」已失效；
+    // 清空后由路线规划（/route）用高德真实里程回填，避免时间轴显示错数。
+    await client.query('UPDATE guide_poi SET leg_km = NULL WHERE guide_id = $1', [input.guideId])
+  })
+
+  // 防御性断言：无论如何节点数都不该变化
+  if (placed.size !== knownIds.size) {
+    throw new Error(`重排后节点数发生变化（${knownIds.size} → ${placed.size}），已中止`)
+  }
+
+  if (filled > 0) {
+    onEvent?.({ type: 'stage', stage: 'planning', message: `已为新节点补上停留时长 / 建议（${filled} 个）` })
+  }
+
+  onEvent?.({ type: 'stage', stage: 'done', message: 'AI 重排完成' })
+
+  return { total: poiRows.length, movedDays, reordered, retimed, filled, usage }
 }

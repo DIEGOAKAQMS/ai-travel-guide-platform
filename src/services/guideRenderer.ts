@@ -79,23 +79,21 @@ const ROUTE_ARROW_HALVE_HEIGHT_B_M = 1_000_000
 
 // ---------------------------------------------------------------- 渲染层级
 //
-// Cesium 的 zIndex 只在**同一类图元**之间排序。这里的线全部是贴地折线
-// （clampToGround → GroundPolylinePrimitive），所以能互相比较、按 zIndex 叠放。
+// Cesium 的 zIndex 只在**同一类图元**之间排序，而且只有贴地折线 / 多边形才有。
+// 这里的线全部是贴地折线（clampToGround → GroundPolylinePrimitive），
+// 所以能互相比较、按 zIndex 叠放。
 //
 // 叠放顺序（由下到上）：线身 → 箭头 → 图标 → 标注。
 //   - 高亮段的外圈/内芯属于「线身」，压在箭头之下，免得盖住别的路段的箭头；
 //   - 带箭头的普通路段整条就是「箭头层」，要高过所有线身；
 //   - 高亮段的箭头最高，因为它是最重要的方向指示；
-//   - 图标与标注走 Billboard/Label 集合，绘制在全部折线之上（天然压过 zIndex），
-//     这里仍显式给出更大的取值，把「图标及其标注永远在最上面」固化下来。
+//   - 图标与标注走 Billboard/Label 集合，整批绘制在全部折线之上，天然压过所有
+//     zIndex；这两个图元本身没有 zIndex 属性，写了也不生效，所以不给。
 const Z_INDEX_TRANSFER_ROUTE = 10
 const Z_INDEX_HIGHLIGHT_RING = 12
 const Z_INDEX_HIGHLIGHT_CORE = 14
 const Z_INDEX_ROUTE_ARROW = 20
 const Z_INDEX_HIGHLIGHT_ARROW = 22
-/** 图标与标注：数值远大于折线层，且标注再高一点，保证标注压在图标之上 */
-const Z_INDEX_POI_ICON = 100
-const Z_INDEX_POI_LABEL = 101
 
 // ---------------------------------------------------------------- 拐弯规避
 
@@ -614,7 +612,8 @@ function measureLabelBox(text: string): { width: number; height: number } {
 function setLabelShown(entry: LabelEntry, show: boolean): void {
   if (entry.shown === show) return
   entry.shown = show
-  if (entry.entity.label) entry.entity.label.show = show
+  // show 声明成 Property，直接赋 boolean 过不了类型检查，包一层 ConstantProperty
+  if (entry.entity.label) entry.entity.label.show = new Cesium.ConstantProperty(show)
 }
 
 /** 把屏幕距离过近的标注按优先级隐藏掉 */
@@ -874,17 +873,37 @@ export function renderGuide(
 
   const highlightColor = Cesium.Color.fromCssColorString(HIGHLIGHT_COLOR)
   const coreColor = Cesium.Color.fromCssColorString(HIGHLIGHT_CORE_COLOR)
-  // 高亮路段必须是**当前这份数据里真实存在**的：改稿 / 重新规划路线后路线 id 全变了，
-  // 若还按「有高亮」去淡化其它路线，会出现「一段都没高亮、整张图的路线却一起变透明」。
+
+  /*
+   * 「有高亮」必须等于「这一段这一帧真的画得出来」——只要成立，其余路线就会被淡到 0.18。
+   *
+   * 反过来（判定为有高亮、但那一段其实没画）会出现用户看到的现象：
+   * 没有任何一段是亮的，整张图的导航线却一起变透明。踩过的坑：
+   *   1. 改稿 / 重排路线后 route id 全变，id 在数据里已经不存在；
+   *   2. 被高亮那段所在的天被隐藏（隐藏的天不画）；
+   *   3. 图例里把「导航路线」分类关掉；
+   *   4. 那一段是「零距离小段」，path 只有一个点，< 2 个点时本来就不画。
+   */
   const highlighted = highlightRouteId
     ? guide.routes.find((route) => route.id === highlightRouteId) ?? null
     : null
-  const hasHighlight = highlighted !== null
+  const highlightedDay = highlighted
+    ? guide.days.find((day) => day.id === highlighted.day_id) ?? null
+    : null
+  const hasHighlight =
+    highlighted !== null &&
+    highlightedDay !== null &&
+    !hiddenDays.includes(highlightedDay.day_index) &&
+    !hiddenCategories.includes(highlighted.transfer ? 'transfer' : 'route') &&
+    Array.isArray(highlighted.path) &&
+    highlighted.path.length >= 2
 
   // 高亮路段两端的节点，图标要加一圈蓝色描边
   const highlightNodeIds = new Set<string>()
-  if (highlighted?.from_poi_id) highlightNodeIds.add(highlighted.from_poi_id)
-  if (highlighted?.to_poi_id) highlightNodeIds.add(highlighted.to_poi_id)
+  if (hasHighlight && highlighted) {
+    if (highlighted.from_poi_id) highlightNodeIds.add(highlighted.from_poi_id)
+    if (highlighted.to_poi_id) highlightNodeIds.add(highlighted.to_poi_id)
+  }
 
   // ---------- 路线 ----------
   for (const route of guide.routes) {
@@ -895,7 +914,9 @@ export function renderGuide(
     if (hiddenCategories.includes(route.transfer ? 'transfer' : 'route')) continue
 
     const color = Cesium.Color.fromCssColorString(dayColor(day.day_index))
-    const isHighlighted = route.id === highlightRouteId
+    // 只有判定为「真的画得出来」的那一段才走高亮分支；否则它会被后面的
+    // 淡化逻辑当成「其它路线」一起淡掉（hasHighlight 为真时其它线是 0.18）
+    const isHighlighted = hasHighlight && route.id === highlightRouteId
 
     if (isHighlighted) {
       renderHighlightedRoute(dataSource, route, highlightColor, coreColor)
@@ -996,8 +1017,6 @@ export function renderGuide(
           disableDepthTestDistance: Number.POSITIVE_INFINITY,
           // 拉远后缩小，避免图标糊成一片
           scaleByDistance: new Cesium.NearFarScalar(1.8e6, 1.0, 6e6, 0.7),
-          // 图标永远压过所有折线层（含箭头）
-          zIndex: Z_INDEX_POI_ICON,
         },
         label: {
           text: labelText,
@@ -1016,8 +1035,6 @@ export function renderGuide(
           disableDepthTestDistance: Number.POSITIVE_INFINITY,
           // 放宽淡出距离：原来 3.5e6 就完全透明，拉远后相当于「看不见」
           translucencyByDistance: new Cesium.NearFarScalar(2.5e6, 1.0, 8e6, 0.25),
-          // 标注再压过图标：最上面一层
-          zIndex: Z_INDEX_POI_LABEL,
         },
       })
 

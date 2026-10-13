@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
+import { useGuideStore } from './guide'
 import type { GuideDto, GuideSavePayload, NodeKind, NodePriority } from '@/types/guide'
 
 /** 主区域视图：地图工作台 / 攻略库 */
@@ -228,6 +229,24 @@ export const useUiStore = defineStore('ui', () => {
   function discardDraft(): void {
     draft.value = null
   }
+
+  /**
+   * 打开的攻略换了人，编辑器草稿就失效了。
+   *
+   * 草稿里存的是**上一份攻略**的天 / 节点 id，切走之后如果还开着保存，
+   * PUT 会带着这些 id 打到新攻略上：新攻略原有的天因为「不在载荷里」
+   * 会被整批删掉，写进去的全是上一份攻略的内容。所以一旦发现不是同一份，直接丢弃。
+   */
+  const guideStore = useGuideStore()
+  watch(
+    () => guideStore.guide?.id ?? null,
+    (id) => {
+      if (!draft.value || draft.value.id === id) return
+      draft.value = null
+      editorOpen.value = false
+      pickingPoiKey.value = null
+    },
+  )
 
   // ---------- 查节点 ----------
   function findPoi(poiKey: string): DraftPoi | null {

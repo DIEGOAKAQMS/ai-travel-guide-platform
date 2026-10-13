@@ -31,11 +31,63 @@ export const config = {
     baseUrl: optional('DEEPSEEK_BASE_URL', 'https://api.deepseek.com'),
     model: optional('DEEPSEEK_MODEL', 'deepseek-flash'),
     /**
-     * deepseek-flash 为推理模型，reasoning_content 会占用输出预算，
-     * 预算不足时 content 会被截断成空串，因此这里给足。
+     * 默认输出预算（含 reasoning token）。
+     *
+     * 推理模型不仅把 reasoning 算进这份额度，而且**和正文共用同一份预算**，
+     * 所以这个值必须按「长思考 + 整份 JSON 正文」来给：
+     * 7 天攻略的正文本身就约 11.5k tokens（库里 raw_llm 实测），长思考一次能烧掉 24k+。
+     * 10 天攻略实测：reasoning 29k + 正文 18.7k = 47.8k tokens，**一次调用就要这么多**。
+     * 给 8192 / 16384 / 32768 的后果是 reasoning 先把额度吃光 —— 正文要么是空串、
+     * 要么写到一半被截断（finish_reason=length），任务必然失败。
+     * 而 32768 起步时 10 天攻略**每跑必失败一次**：首轮跑满 181 秒被截断丢弃、
+     * 翻倍重试才成功，等于把 8 分钟的生成白白拖长 3 分钟，所以起步值必须 ≥ 65536。
+     * 各任务另在调用处按需覆盖（见 llm.ts）：重排 16384、提问 2048。
      */
-    maxTokens: Number(optional('DEEPSEEK_MAX_TOKENS', '16384')),
-    timeoutMs: Number(optional('DEEPSEEK_TIMEOUT_MS', '300000')),
+    maxTokens: Number(optional('DEEPSEEK_MAX_TOKENS', '65536')),
+    /**
+     * 思考强度：low / high / max，或 off 直接关闭思考。
+     *
+     * 这里用官方默认档 high：排程要考虑跨天衔接、高原行车耗时、地理顺路性，
+     * 思考深度直接影响这几件事的合理性，宁可慢一点也要排得对。
+     * （官方映射表里 medium 会被归到 high，所以实际只有三档。）
+     *
+     * 嫌慢可以降档，改这一个环境变量即可：
+     *   DEEPSEEK_REASONING_EFFORT=low    明显提速，复杂线路会略粗糙
+     *   DEEPSEEK_REASONING_EFFORT=off    最快，质量下降较明显
+     */
+    reasoningEffort: optional('DEEPSEEK_REASONING_EFFORT', 'high'),
+    /**
+     * 澄清提问（正式排行程前的反问）用的思考强度。
+     *
+     * 默认 off：这一步只是产出「还需要向用户确认哪些信息」，用不着深度推理，
+     * 关掉思考能明显加快出题速度。想让它也走深思就设成 high。
+     */
+    clarifyReasoningEffort: optional('DEEPSEEK_CLARIFY_REASONING_EFFORT', 'off'),
+    /**
+     * 空闲超时（毫秒）：多久没收到任何数据就判定卡死。
+     *
+     * 用「空闲」而不是「总时长」作为判据，是因为只要模型还在往外吐字就
+     * 说明它在干活，不该被打断。
+     */
+    idleMs: Number(optional('DEEPSEEK_IDLE_MS', '60000')),
+    /**
+     * 总超时（毫秒）：一次请求的硬上限，兜底防止无限拖下去。
+     *
+     * 要按最大预算来给：65536 tokens 的响应按实测吞吐（约 180 tokens/s）得跑 6 分钟左右，
+     * 卡在 5 分钟会把本来能成功的大预算生成直接砍掉（超时不重试，白等）。
+     * 真正卡死的请求由空闲超时（idleMs）负责兜。
+     */
+    totalMs: Number(optional('DEEPSEEK_TOTAL_MS', '600000')),
+    /**
+     * 追加进请求体的额外参数（JSON 字符串），用来试各家网关的「降低思考强度」开关。
+     *
+     * 不同网关参数名不一样，所以不写死，留个口子按需配，例如：
+     *   DEEPSEEK_EXTRA_BODY={"reasoning_effort":"low"}
+     *   DEEPSEEK_EXTRA_BODY={"thinking":{"type":"disabled"}}
+     *   DEEPSEEK_EXTRA_BODY={"enable_thinking":false}
+     * 留空则不追加任何字段。
+     */
+    extraBody: optional('DEEPSEEK_EXTRA_BODY', ''),
   },
 
   amap: {

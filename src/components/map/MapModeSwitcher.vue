@@ -13,7 +13,7 @@ const mapStore = useMapStore()
       class="map-mode__btn"
       :class="{ 'is-active': mapStore.activeBasemap === item.key }"
       type="button"
-      :title="`切换到${item.name}地图`"
+      :title="`切换到${item.name}底图`"
       @click="mapStore.setBasemap(item.key)"
     >
       <span class="map-mode__swatch" :style="{ background: item.swatch }" />
