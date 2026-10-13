@@ -1,5 +1,7 @@
 # 旅游攻略管理平台 · 三维地图底座
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 > **本项目代码由 AI 编程助手编写**：需求沟通与方案取舍由人完成，代码实现、调试与文档均由 AI 生成。
 
 基于 **Cesium + Vue3 + Vite + TypeScript + Node/Express + PostgreSQL(PostGIS)** 的 B 端旅游攻略系统。
@@ -30,7 +32,15 @@
 
 ### 2.0 前置要求（clone 后先做这些）
 
-下面四项不满足，后面任何一步都跑不起来：
+**要申请的 key 就这 3 个**，都填进根目录 `config.env`，申请步骤见 [三、需要申请的 Token](#三需要申请的-token)：
+
+| key | 配置项 | 申请入口 | 不配会怎样 |
+| --- | --- | --- | --- |
+| 天地图 token | `VITE_TIANDITU_TOKEN` | [天地图控制台](https://console.tianditu.gov.cn/api/key) | 底图 403，页面弹提示条 |
+| 高德 key（类型必须选 **Web 服务**） | `AMAP_KEY` | [高德开放平台](https://console.amap.com/dev/key/app) | **后端启动直接报错** |
+| DeepSeek API key | `DEEPSEEK_API_KEY` | [DeepSeek 平台](https://platform.deepseek.com/api_keys) | **后端启动直接报错** |
+
+再加上数据库连接 `PGPASSWORD`。除此之外的下面四项环境要求不满足，任何一步都跑不起来：
 
 **① Node.js ≥ 22**
 
@@ -86,6 +96,8 @@ npm run dev         # http://127.0.0.1:5300
 文件里逐项写了「去哪申请 / 留空的后果 / 计费等级」。最小可跑需要填：  
 `PGPASSWORD`、`DEEPSEEK_API_KEY`、`AMAP_KEY`、`VITE_TIANDITU_TOKEN`。
 
+👉 **这三个 key 去哪申请、类型怎么选、不配会怎样**，见 [三、需要申请的 Token](#三需要申请的-token)。
+
 读取优先级（同一项取第一个非空值）：
 
 ```
@@ -118,23 +130,88 @@ npm run type-check  # 前端类型检查
 > **注意**：Cesium 的 Worker / Assets 等静态资源必须经 HTTP 提供，**不能直接双击 `index.html` 打开**（`file://` 协议下会 404）。  
 > 请使用 `npm run dev`（开发）或 `npm run preview`（构建产物预览）。
 
-## 三、天地图配置
+## 三、需要申请的 Token
 
-1. 到 [天地图控制台](https://console.tianditu.gov.cn/api/key) 申请 token。
+项目依赖三个需要你自己申请凭证的外部服务。**三者缺一就跑不起来**（前端弹提示条、后端直接抛错拒绝启动），
+凭证统一填在根目录的 `config.env` 里。
+
+| 服务 | 用来做什么 | 申请入口 | 费用 |
+| --- | --- | --- | --- |
+| **天地图 开发者 token** | ① 前端底图瓦片<br>② 后端地理编码兜底（高德失败时） | [天地图控制台](https://console.tianditu.gov.cn/api/key) | 个人免费额度较大；商用需单独授权 |
+| **高德 Web 服务 key** | 逐个节点的地理编码 + 驾车路径规划算路 | [高德开放平台](https://console.amap.com/dev/key/app) | 按调用量计费，个人账号有免费日配额 |
+| **DeepSeek API key** | 生成逐日行程骨架（项目里唯一用到大模型的地方） | [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) | **按 token 计费，是本项目最大的成本项** |
+
+另外两项**可以不申请**，都有免 token 的兜底方案：
+
+| 服务 | 用来做什么 | 不配置会怎样 |
+| --- | --- | --- |
+| Cesium Ion token | 三维高程地形（World Terrain） | 自动降级到公共 ArcGIS World Elevation 3D，仍有三维起伏、免 token |
+| 天地图「服务端」key | 后端地理编码兜底 | 高德全部成功时用不到；高德批量失败时只能靠人工修坐标 |
+
+### 3.1 天地图（前端底图 + 后端兜底）
+
+1. 到 [天地图控制台](https://console.tianditu.gov.cn/api/key) 申请 token。两种用途建议分开申请：
+   - **浏览器端应用** → 给前端底图瓦片用（绑**域名**白名单）
+   - **服务端应用** → 给后端 REST 地理编码用（绑 **IP** 白名单）
+
+   控制台里的选项名称以实际页面为准，本项目只用到这两个用途。
+
 2. 编辑项目根目录 `config.env`：
 
 ```ini
-# 前端底图瓦片用（必须带 VITE_ 前缀，Vite 才会注入到浏览器端代码）
-VITE_TIANDITU_TOKEN=你的token
+# 前端底图瓦片用（必须带 VITE_ 前缀，Vite 才会注入浏览器端代码）
+VITE_TIANDITU_TOKEN=你的浏览器端token
 
-# 后端落点兜底地理编码用（可选）
-TIANDITU_TOKEN=你的token
+# 后端落点兜底地理编码用（可选，建议一起配）
+TIANDITU_TOKEN=你的服务端token
 ```
 
-1. **把 `localhost:5188` 与 `127.0.0.1:5188` 加入天地图控制台的域名白名单**，否则瓦片会返回 403。  
-   天地图 token 与域名绑定，部署上线时需把正式域名一并加入白名单。
+3. **把 `localhost:5188` 与 `127.0.0.1:5188` 加入域名白名单**，否则瓦片返回 403、地图一片黑。
+   token 与域名绑定，部署上线时要把正式域名一并加进白名单。
+4. **不配的后果**：页面顶部弹出黄色提示条「未检测到天地图 token…」，底图不显示（其余功能正常）。
 
-修改 `config.env` 后需重启 `npm run dev` 才会生效（前端配置是构建期注入的）。
+### 3.2 高德 Web 服务（地理编码 + 路径规划）
+
+1. 到 [高德开放平台](https://console.amap.com/dev/key/app) 创建应用 → 添加 key。
+2. ⚠️ **key 类型必须选「Web 服务」**，不是「Web端(JS API)」。本项目是**服务端直接调 REST 接口**，
+   选错类型地理编码和算路都会直接无权限（这是最容易踩的坑）。
+3. 编辑 `config.env`：
+
+```ini
+AMAP_KEY=你的key
+
+# 两次请求之间的最小间隔（毫秒）。高德对并发 QPS 有硬限制，
+# 实测并发会报 10021 CUQPS_HAS_EXCEEDED_THE_LIMIT，保持默认的串行限速即可
+AMAP_MIN_INTERVAL_MS=350
+```
+
+4. **不配的后果**：`AMAP_KEY` 在代码里是必填项，**后端启动即抛错**。即使绕过去，节点也没有坐标，
+   地图上不会画出行车路线。
+5. **配额消耗参考**：一次 15 天攻略 ≈ 落点 80~90 次 + 算路 70~80 段 ≈ **160 次调用**。
+
+### 3.3 DeepSeek（生成行程骨架）
+
+1. 到 [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) 创建 API key。
+2. 编辑 `config.env`：
+
+```ini
+DEEPSEEK_API_KEY=你的key
+DEEPSEEK_MODEL=deepseek-flash
+
+# 输出预算。注意：reasoning_content 和 JSON 正文算在同一份额度里，
+# 别调到 32768 以下 —— 必然写满被截断、再翻倍重试，反而更贵
+DEEPSEEK_MAX_TOKENS=65536
+
+# 思考强度 off / low / high。思考 token 占输出约 84%，这一项对成本影响最大
+DEEPSEEK_REASONING_EFFORT=high
+```
+
+3. **不配的后果**：后端启动即抛错，AI 生成不可用（地图浏览、已有攻略的查看不受影响）。
+4. **成本参考**：实测一次 10 天攻略 ≈ 思考 29k + 正文 18.7k ≈ **47.8k tokens**；
+   详细权衡见 [9.3 关键设计决策](#93-关键设计决策)。
+
+改完 `config.env` 里的 `VITE_*` 项需重启 `npm run dev` 才生效（前端配置是构建期注入的）；
+后端项重启 `server` 即可。
 
 ## 四、图层体系说明
 
